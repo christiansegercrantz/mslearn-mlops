@@ -12,8 +12,8 @@ permissions:
 jobs:
   deploy-prod:
     if: >-
-      github.event.issue.pull_request != null &&
-      contains(github.event.comment.body, '/deploy-prod')
+      github.event.issue.pull_request != null && contains(github.event.comment.body, '/deploy-prod')
+
     runs-on: ubuntu-latest
     environment: prod
 
@@ -26,7 +26,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install Azure SDK dependencies
         run: |
@@ -45,9 +45,9 @@ jobs:
       - name: Detect Azure ML workspace
         id: detect
         run: |
-          RG_NAME=$(az group list --query "[?starts_with(name,'rg-ai300-l')].name | [0]" -o tsv)
+          RG_NAME=$(az group list --query "[?starts_with(name,'chriso-sandbox-rg')].name | [0]" -o tsv)
           if [ -z "$RG_NAME" ]; then
-            echo "No resource group starting with rg-ai300-l found." >&2
+            echo "No resource group starting with chriso-sandbox-rg found." >&2
             exit 1
           fi
 
