@@ -147,7 +147,7 @@ def main():
     marker['nonce'] = nonce
     attempts = []
     R['attempts'] = attempts
-    for score, region, sinfo, avail in cands[:3]:
+    for score, region, sinfo, avail in cands[:2]:
         sku = sinfo['sku']
         pre = 'c211-i120316-' + nonce
         vnet = pre + '-' + region + '-vnet'; sn = pre + '-' + region + '-subnet'; nic = pre + '-' + region + '-nic'; vm = pre + '-' + region + '-vm'
@@ -161,11 +161,28 @@ def main():
         att['steps']['vnet_create'] = {'status': s1, 'resp': (r1 if s1 not in (200, 201) else {'id': r1.get('id')}), 'err': (r1.get('error') or {}).get('code') if isinstance(r1, dict) else None}
         if s1 not in (200, 201):
             continue
+        # wait until vnet + subnet provisioningState == Succeeded (async PUT)
+        settle = None
+        for i in range(36):
+            stsv, vs = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}?api-version=2024-01-01')
+            props = (vs.get('properties') or {}) if stsv == 200 else {}
+            vp = props.get('provisioningState')
+            sp = [((sn0.get('properties') or {}).get('provisioningState')) for sn0 in (props.get('subnets') or [])]
+            settle = {'vnet': vp, 'subnets': sp, 'status': stsv}
+            if stsv == 200 and vp == 'Succeeded' and all(x == 'Succeeded' for x in sp):
+                break
+            time.sleep(5)
+        att['steps']['vnet_settle'] = settle
         subnet_id = f'/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{sn}'
         nb = {'location': region, 'tags': {'c211': 'i120316', 'nonce': nonce},
               'properties': {'ipConfigurations': [{'name': 'ipcfg', 'properties': {'privateIPAllocationMethod': 'Dynamic', 'subnet': {'id': subnet_id}}}]}}
-        s2, r2, _ = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/networkInterfaces/{nic}?api-version=2024-01-01', nb)
-        att['steps']['nic_create'] = {'status': s2, 'resp': (r2 if s2 not in (200, 201) else {'id': r2.get('id')}), 'err': (r2.get('error') or {}).get('code') if isinstance(r2, dict) else None}
+        s2 = None; r2 = None; tries = []
+        for i in range(15):
+            s2, r2, h2 = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/networkInterfaces/{nic}?api-version=2024-01-01', nb)
+            tries.append({'status': s2, 'retry_after': h2.get('Retry-After'), 'code': ((r2.get('error') or {}).get('code') if isinstance(r2, dict) else None)})
+            if s2 in (200, 201): break
+            time.sleep(12)
+        att['steps']['nic_create'] = {'status': s2, 'resp': (r2 if s2 not in (200, 201) else {'id': r2.get('id')}), 'err': (r2.get('error') or {}) if s2 not in (200, 201) else None, 'tries': tries}
         if s2 not in (200, 201):
             cleanup(tok, sub, RG, vnet=vnet, nic=None, vm=None, R=R)
             continue
@@ -179,9 +196,14 @@ def main():
                 'networkProfile': {'networkInterfaces': [{'id': r2.get('id'), 'properties': {'deleteOption': 'Delete'}}]}}}
         if sinfo.get('zones'):
             vmb['zones'] = [sinfo['zones'][0]]
-        s3, r3, _ = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01', vmb, timeout=180)
+        s3 = None; r3 = None; vtries = []
+        for i in range(12):
+            s3, r3, h3 = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01', vmb, timeout=180)
+            vtries.append({'status': s3, 'retry_after': h3.get('Retry-After'), 'code': ((r3.get('error') or {}).get('code') if isinstance(r3, dict) else None)})
+            if s3 in (200, 201): break
+            time.sleep(15)
         att['steps']['vm_create'] = {'status': s3, 'resp': (r3 if s3 not in (200, 201) else {'id': r3.get('id'), 'name': r3.get('name')}),
-                                     'err': (r3.get('error') or {}) if isinstance(r3, dict) else None}
+                                     'err': (r3.get('error') or {}) if isinstance(r3, dict) else None, 'tries': vtries}
         if s3 not in (200, 201):
             cleanup(tok, sub, RG, vnet=vnet, nic=nic, vm=None, R=R)
             continue
