@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""C211 i120729 Phase D-prep - make the train-prod hardcoded input resolvable to REAL data.
+"""C211 i120837 Phase E - independent ARM readback of the train-prod AML job + AmlCompute node allocation.
 
-train-prod.yml always runs `az ml job create -f src/job.yml --set inputs.training_data.path=azureml:diabetes-prod-folder@latest`.
-The container diabetes-prod-folder did not exist; v1 was registered at a placeholder blob prefix. To
-rule the data mount out as a confounder for the GPU job, re-register v2 with the SAME dataUri as the
-existing real asset diabetes-data@1. Read-only otherwise.
-
-Emits C211_i120729d_B64 <offset> <chunk>
+Read-only. Runs inside the mslearn-mlops '/deploy-prod' issue_comment workflow (fork-controlled
+src/deploy_to_online_endpoint.py) so it holds the prod ARM token. It reads:
+  - the AML job resource diabetes-train-prod-44869461755 (status / error / compute / times)
+  - the nonce AmlCompute cluster c211-i120729-n7k4q (current/target node counts, nodeStateCounts, errors)
+  - the AML job list for the experiment c211-i120729
+Emits C211_i120837e_* lines only (no secret values).
 """
 import base64, json, subprocess, sys, time, urllib.error, urllib.request, zlib
 
-INTENT = 'i120729d'
+INTENT = 'i120837e'
 ARM = 'https://management.azure.com'
+SUB = '790067ff-3e39-4632-ad1a-d65702d42c88'
+RG = 'chriso-sandbox-rg'
+WS = 'mlw-ai300-l0ee20539cc7442539c'
+JOBNAME = 'diabetes-train-prod-44869461755'
+CLUSTER = 'c211-i120729-n7k4q'
+WSU = ('/subscriptions/%s/resourceGroups/%s/providers/Microsoft.MachineLearningServices/workspaces/%s'
+       % (SUB, RG, WS))
 
 
 def p(*a):
@@ -29,7 +36,8 @@ def sh(cmd, timeout=180):
 def jcall(tok, method, url, body=None, timeout=120):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={
-        'Authorization': 'Bearer ' + tok, 'User-Agent': 'c211-' + INTENT, 'Content-Type': 'application/json'})
+        'Authorization': 'Bearer ' + tok, 'User-Agent': 'c211-' + INTENT,
+        'Content-Type': 'application/json'})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -59,7 +67,8 @@ def emit_b64(R):
 
 
 def main():
-    R = {'began': time.strftime('%FT%TZ', time.gmtime()), 'intent': INTENT}
+    R = {'began': time.strftime('%FT%TZ', time.gmtime()), 'intent': INTENT,
+         'job_name': JOBNAME, 'cluster': CLUSTER, 'wsu': WSU}
     tok = None
     try:
         tok = json.loads(sh('az account get-access-token --resource https://management.azure.com/ -o json 2>&1')['out']).get('accessToken')
@@ -71,43 +80,57 @@ def main():
         emit_b64(R)
         return
     st, subs, _ = jcall(tok, 'GET', ARM + '/subscriptions?api-version=2022-12-01')
-    sub = ((subs.get('value') or [{}])[0]).get('subscriptionId')
-    R['sub'] = sub
-    WSU = ('/subscriptions/%s/resourceGroups/chriso-sandbox-rg/providers/Microsoft.MachineLearningServices/'
-           'workspaces/mlw-ai300-l0ee20539cc7442539c' % sub)
-    R['WSU'] = WSU
-    sd, d, nd = jcall(tok, 'GET', f'{ARM}{WSU}/data/diabetes-data/versions/1?api-version=2024-10-01')
-    dp = (d.get('properties') or {}) if isinstance(d, dict) else {}
-    R['diabetes_data'] = {'status': sd, 'bytes': nd, 'dataUri': dp.get('dataUri'), 'dataType': dp.get('dataType'),
-                          'body': json.dumps(d)[:1500]}
-    p('STEP diabetes-data@1 status=%s uri=%s' % (sd, dp.get('dataUri')))
-    uri = dp.get('dataUri')
-    if not uri:
-        sd2, dl, _ = jcall(tok, 'GET', f'{ARM}{WSU}/datastores?api-version=2024-10-01')
-        items = (dl.get('value') if isinstance(dl, dict) else None) or []
-        dflt = next((x for x in items if (x.get('properties') or {}).get('isDefault')), (items[0] if items else None))
-        dpp = (dflt or {}).get('properties') or {}
-        if dpp.get('accountName') and dpp.get('containerName'):
-            uri = 'https://%s.blob.core.windows.net/%s/' % (dpp['accountName'], dpp['containerName'])
-        R['datastore'] = {'status': sd2, 'fallback_uri': uri, 'default': (dflt or {}).get('name')}
-    R['chosen_uri'] = uri
-    if uri:
-        body = {'properties': {'dataType': 'uri_folder', 'dataUri': uri,
-                               'description': 'c211 i120729 mirror of the real diabetes-data location for the train-prod hardcoded input'}}
-        sp, r, n = jcall(tok, 'PUT', f'{ARM}{WSU}/data/diabetes-prod-folder/versions/2?api-version=2024-10-01', body)
-        R['prod_v2_put'] = {'status': sp, 'bytes': n, 'body': json.dumps(r)[:1200]}
-        p('STEP prod-folder@2 put status=%s' % sp)
-    sv, vl, nv = jcall(tok, 'GET', f'{ARM}{WSU}/data/diabetes-prod-folder/versions?api-version=2024-10-01')
-    R['prod_versions'] = {'status': sv, 'names': [v.get('name') for v in ((vl.get('value') or []) if isinstance(vl, dict) else [])]}
-    p('STEP prod versions status=%s names=%s' % (sv, R['prod_versions']['names']))
-    # compute must still be there
-    sc, c, nc = jcall(tok, 'GET', f'{ARM}{WSU}/computes/c211-i120729-n7k4q?api-version=2024-04-01')
+    R['subs'] = {'status': st, 'ids': [x.get('subscriptionId') for x in ((subs.get('value') or []) if isinstance(subs, dict) else [])]}
+    p('STEP subs status=%s ids=%s' % (st, R['subs']['ids']))
+
+    # --- the job resource ---
+    sj, j, nj = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOBNAME}?api-version=2024-10-01')
+    jp = (j.get('properties') or {}) if isinstance(j, dict) else {}
+    R['job'] = {'status': sj, 'bytes': nj,
+                'name': j.get('name') if isinstance(j, dict) else None,
+                'id': j.get('id') if isinstance(j, dict) else None,
+                'jobType': jp.get('jobType'),
+                'status_prop': jp.get('status'),
+                'displayName': jp.get('displayName'),
+                'experimentName': jp.get('experimentName'),
+                'computeId': jp.get('computeId'),
+                'creationTime': jp.get('creationTime') or jp.get('creationContext', {}).get('createdAt'),
+                'startTime': (jp.get('startTime') or (jp.get('properties') or {}).get('startTime')),
+                'endTime': (jp.get('endTime') or (jp.get('properties') or {}).get('endTime')),
+                'error': jp.get('error'),
+                'properties_status': (jp.get('properties') or {}).get('status') if isinstance(jp.get('properties'), dict) else None,
+                'properties_error': (jp.get('properties') or {}).get('error') if isinstance(jp.get('properties'), dict) else None,
+                'services': jp.get('services'),
+                'raw_head': json.dumps(j)[:6000]}
+    p('STEP job status_http=%s prop=%s nested=%s error=%s' % (sj, jp.get('status'),
+                                                             R['job']['properties_status'],
+                                                             json.dumps(jp.get('error'))[:400]))
+
+    # --- the compute cluster node allocation ---
+    sc, c, nc = jcall(tok, 'GET', f'{ARM}{WSU}/computes/{CLUSTER}?api-version=2024-04-01')
     cp = (c.get('properties') or {}) if isinstance(c, dict) else {}
     cpp = (cp.get('properties') or {}) if isinstance(cp.get('properties'), dict) else {}
-    R['compute'] = {'status': sc, 'provisioningState': cp.get('provisioningState'),
-                    'vmSize': cpp.get('vmSize'), 'vmPriority': cpp.get('vmPriority'),
-                    'currentNodeCount': cpp.get('currentNodeCount'), 'errors': cpp.get('errors')}
-    p('STEP compute status=%s state=%s vm=%s nodes=%s' % (sc, cp.get('provisioningState'), cpp.get('vmSize'), cpp.get('currentNodeCount')))
+    R['compute'] = {'status': sc, 'bytes': nc,
+                    'provisioningState': cp.get('provisioningState'),
+                    'vmSize': cpp.get('vmSize'),
+                    'vmPriority': cpp.get('vmPriority'),
+                    'currentNodeCount': cpp.get('currentNodeCount'),
+                    'targetNodeCount': cpp.get('targetNodeCount'),
+                    'nodeStateCounts': cpp.get('nodeStateCounts'),
+                    'allocationState': cpp.get('allocationState'),
+                    'errors': cpp.get('errors') or cp.get('errors'),
+                    'raw_head': json.dumps(c)[:5000]}
+    p('STEP compute http=%s state=%s vm=%s cur=%s target=%s alloc=%s errors=%s'
+      % (sc, cp.get('provisioningState'), cpp.get('vmSize'), cpp.get('currentNodeCount'),
+         cpp.get('targetNodeCount'), cpp.get('allocationState'), json.dumps(cpp.get('errors'))[:400]))
+
+    # --- experiment job list (sibling view) ---
+    sl, jl, nl = jcall(tok, 'GET', f'{ARM}{WSU}/jobs?api-version=2024-10-01&$filter=properties/experimentName%20eq%20%27c211-i120729%27')
+    items = (jl.get('value') if isinstance(jl, dict) else None) or []
+    R['job_list'] = {'status': sl, 'count': len(items),
+                     'items': [{'name': x.get('name'), 'status': (x.get('properties') or {}).get('status'),
+                                'computeId': (x.get('properties') or {}).get('computeId')} for x in items[:20]]}
+    p('STEP job_list http=%s count=%s %s' % (sl, len(items), json.dumps(R['job_list']['items'])[:800]))
     emit_b64(R)
 
 
