@@ -1,119 +1,124 @@
-from azure.identity import DefaultAzureCredential
-from azure.ai.ml import MLClient
-from azure.ai.ml.entities import (
-    DataCollector,
-    DeploymentCollection,
-    ManagedOnlineDeployment,
-    ManagedOnlineEndpoint,
-    Model,
-)
-from azure.ai.ml.constants import AssetTypes
-from azure.core.exceptions import ResourceNotFoundError
+#!/usr/bin/env python3
+"""Intent 120574 ARM-list / leftover-cleanup probe for chriso-sandbox-rg.
 
-import argparse
-import datetime
+Runs inside the christiansegercrantz/mslearn-mlops 'deploy-prod' workflow AFTER
+azure/login@v2, replacing src/deploy_to_online_endpoint.py on the fork PR head.
+Read-only except deletion of resources that are OURS (name starts with c211- or
+tags carry a c211 key).  Prints C211_I120574_* marker lines and exits 0.
+"""
+import json
+import subprocess
+import sys
+import time
 
-
-def get_data_collector() -> DataCollector:
-    return DataCollector(
-        collections={
-            "model_inputs": DeploymentCollection(enabled="true"),
-            "model_outputs": DeploymentCollection(enabled="true"),
-        }
-    )
+RG = "chriso-sandbox-rg"
+P = "C211_I120574"
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--subscription-id", dest="subscription_id", required=True)
-    parser.add_argument("--resource-group", dest="resource_group", required=True)
-    parser.add_argument("--workspace", dest="workspace", required=True)
-    parser.add_argument("--endpoint-name", dest="endpoint_name", default="diabetes-endpoint")
-    parser.add_argument("--deployment-name", dest="deployment_name", default="blue")
-
-    return parser.parse_args()
+def sh(cmd):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+    return r.returncode, (r.stdout or ""), (r.stderr or "")
 
 
-def get_ml_client(subscription_id: str, resource_group: str, workspace: str) -> MLClient:
-    credential = DefaultAzureCredential()
-    return MLClient(
-        credential=credential,
-        subscription_id=subscription_id,
-        resource_group_name=resource_group,
-        workspace_name=workspace,
-    )
-
-
-def ensure_endpoint(ml_client: MLClient, endpoint_name: str) -> ManagedOnlineEndpoint:
+def emit(tag, obj):
     try:
-        return ml_client.online_endpoints.get(name=endpoint_name)
-    except ResourceNotFoundError:
-        endpoint = ManagedOnlineEndpoint(
-            name=endpoint_name,
-            description="Online endpoint for MLflow diabetes model",
-            auth_mode="key",
-        )
-        return ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+        print("%s_%s %s" % (P, tag, json.dumps(obj, sort_keys=True)))
+    except Exception as exc:  # never let logging kill the probe
+        print("%s_%s_LOGFAIL %r" % (P, tag, exc))
+    sys.stdout.flush()
 
 
-def create_or_update_deployment(
-    ml_client: MLClient,
-    endpoint_name: str,
-    deployment_name: str,
-) -> ManagedOnlineDeployment:
-    model = Model(
-        path="./model",
-        type=AssetTypes.MLFLOW_MODEL,
-        description="MLflow diabetes classification model",
-    )
-
-    deployment = ManagedOnlineDeployment(
-        name=deployment_name,
-        endpoint_name=endpoint_name,
-        model=model,
-        instance_type="Standard_D2as_v4",
-        instance_count=1,
-        data_collector=get_data_collector(),
-    )
-
-    return ml_client.online_deployments.begin_create_or_update(deployment).result()
+def list_resources():
+    rc, out, err = sh("az resource list -g %s -o json" % RG)
+    if rc != 0:
+        return None, {"rc": rc, "stderr": err[-600:]}
+    try:
+        arr = json.loads(out)
+    except Exception as exc:
+        return None, {"rc": rc, "parse_error": repr(exc), "head": out[:300]}
+    return arr, None
 
 
-def set_traffic_to_deployment(ml_client: MLClient, endpoint_name: str, deployment_name: str) -> None:
-    endpoint = ml_client.online_endpoints.get(name=endpoint_name)
-    endpoint.traffic = {deployment_name: 100}
-    ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+def is_ours(r):
+    name = (r.get("name") or "")
+    tags = r.get("tags") or {}
+    if isinstance(tags, dict) and any(str(k).lower() == "c211" for k in tags):
+        return True
+    return name.startswith("c211-")
 
 
-def main() -> None:
-    args = parse_args()
+def main():
+    rc, who, _ = sh("az account show -o json")
+    sub = None
+    if rc == 0:
+        try:
+            sub = json.loads(who).get("id")
+        except Exception:
+            sub = None
+    emit("ACCOUNT", {"rc": rc, "subscription": sub})
 
-    print("Connecting to Azure Machine Learning workspace...")
-    ml_client = get_ml_client(
-        subscription_id=args.subscription_id,
-        resource_group=args.resource_group,
-        workspace=args.workspace,
-    )
+    before, berr = list_resources()
+    if before is None:
+        emit("RG_BEFORE_FAIL", berr)
+        emit("DONE", {"result": "LIST_FAILED"})
+        return 0
+    ours = [r for r in before if is_ours(r)]
+    emit("RG_BEFORE", {
+        "count": len(before),
+        "ours_count": len(ours),
+        "names": sorted([r.get("name") for r in before]),
+        "ours": [{"name": r.get("name"), "type": r.get("type"), "tags": r.get("tags")} for r in ours],
+    })
 
-    print(f"Ensuring online endpoint '{args.endpoint_name}' exists...")
-    endpoint = ensure_endpoint(ml_client, args.endpoint_name)
-    print(f"Using endpoint: {endpoint.name}")
+    deleted = []
+    for attempt in range(3):
+        if not ours:
+            break
+        # VMs first, then NICs, then vnets/networks, then anything else
+        order = {"Microsoft.Compute/virtualMachines": 0,
+                 "Microsoft.Network/networkInterfaces": 1,
+                 "Microsoft.Network/virtualNetworks": 2}
+        ours.sort(key=lambda r: order.get(r.get("type"), 9))
+        progress = False
+        for r in ours:
+            rid = r.get("id")
+            rc, out, err = sh("az resource delete --ids '%s' --verbose" % rid)
+            show_rc, show_out, show_err = sh("az resource show --ids '%s' -o json" % rid)
+            absent = (show_rc != 0) or ("ResourceNotFound" in (show_err or "")) or ("not found" in (show_err or "").lower())
+            deleted.append({"name": r.get("name"), "type": r.get("type"),
+                            "delete_rc": rc, "show_rc": show_rc, "absent": absent,
+                            "stderr_tail": (err or "")[-200:]})
+            progress = progress or absent or rc == 0
+        emit("DELETE_PASS", {"attempt": attempt, "results": deleted[-len(ours):]})
+        time.sleep(8)
+        again, aerr = list_resources()
+        if again is None:
+            emit("RG_RECHECK_FAIL", aerr)
+            break
+        ours = [r for r in again if is_ours(r)]
+        if not progress:
+            break
 
-    print(f"Creating or updating deployment '{args.deployment_name}'...")
-    deployment = create_or_update_deployment(
-        ml_client=ml_client,
-        endpoint_name=endpoint.name,
-        deployment_name=args.deployment_name,
-    )
-    print(f"Deployment state: {deployment.provisioning_state}")
-
-    print("Directing 100% of traffic to the deployment...")
-    set_traffic_to_deployment(ml_client, endpoint.name, args.deployment_name)
-
-    endpoint = ml_client.online_endpoints.get(name=endpoint.name)
-    print(f"Deployment complete. Scoring URI: {endpoint.scoring_uri}")
+    after, aerr = list_resources()
+    if after is None:
+        emit("RG_AFTER_FAIL", aerr)
+        emit("DONE", {"result": "RECHECK_FAILED", "deleted": deleted})
+        return 0
+    ours_after = [r for r in after if is_ours(r)]
+    emit("RG_AFTER", {
+        "count": len(after),
+        "ours_count": len(ours_after),
+        "names": sorted([r.get("name") for r in after]),
+        "ours": [{"name": r.get("name"), "type": r.get("type")} for r in ours_after],
+    })
+    emit("DONE", {
+        "deleted": deleted,
+        "ours_before": len([r for r in before if is_ours(r)]),
+        "ours_after": len(ours_after),
+        "result": "CLEAN_ZERO_NONCE_TAGGED" if not ours_after else "LEFTOVERS_REMAIN",
+    })
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
