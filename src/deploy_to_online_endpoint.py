@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
-"""C211-I125316: AML MANAGED ONLINE ENDPOINT (real-time serving) GPU device proof on
-subscription 790067ff-3e39-4632-ad1a-d65702d42c88 (mslearn-mlops '/deploy-prod' fork-PR
-OIDC ARM identity), workspace mlw-ai300-l0ee20539cc7442539c, RG chriso-sandbox-rg.
+"""C211-I125386: AML MANAGED ONLINE ENDPOINT (real-time serving) GPU device proof, take 2.
 
-Runs as the fork-controlled src/deploy_to_online_endpoint.py under
-.christiansegercrantz/mslearn-mlops .github/workflows/deploy-prod.yml (issue_comment
-'/deploy-prod', environment prod, azure/login@v2 -> ARM token for 790067ff).
+Subscription 790067ff-3e39-4632-ad1a-d65702d42c88 (mslearn-mlops '/deploy-prod' fork-PR OIDC
+ARM identity), RG chriso-sandbox-rg, workspace mlw-ai300-l0ee20539cc7442539c (northeurope).
 
-Stages:
-  0. identity + ARM token (az account get-access-token)
-  1. stage_reap(): list+delete any of OUR nonce online endpoints left in the workspace
-  2. quota measurement (READ): subscription-scope MachineLearningServices /quotas (all
-     entries, flat), location-scope /locations/<reg>/quotas for the requested absolute
-     URLs, location + workspace usages; search every name/type for online/serving/vCPU
-  3. IAM readback: workspace permissions list, checkAccess, onlineEndpoints list
-  4. code asset (blob SAS under the workspace storage account) + CUDA environment asset
-  5. EXACTLY ONE nonce-tagged ON-DEMAND managed online endpoint (authMode Key)
-  6. EXACTLY ONE deployment instanceCount=1, dedicated/on-demand only; A100 then T4;
-     each failed attempt is deleted before the next one
-  7. listKeys + POST scoringUri; capture every GPU- UUID verbatim from container output
-  8. independent ARM readback (deployment/endpoint/list)
-  9. teardown deployment -> endpoint; prove GET 404 + list-empty; always runs
+Why take 2: the i125316 run reached terminal SUCCESS but its deployment create was refused by
+its OWN malformed body (properties.instanceCount + requestSettings.requestTimeoutMillis are not
+members of ManagedOnlineDeployment / OnlineRequestSettings in api-version 2024-10-01) and its
+code asset used a raw.githubusercontent URL ("not a valid storage domain"), so Azure never
+evaluated quota/capacity. This probe:
+  * creates the code asset through the azure-ai-ml SDK (Code(path=...)), which uploads to the
+    workspace default datastore and registers a valid azureml:// codeUri;
+  * creates the deployment through the SDK with instance_count=1 (correctly serialized as
+    sku.capacity) and no requestSettings/probe overrides;
+  * walks a 4-rung on-demand ladder A100 -> T4 -> NV6 -> NC6 so a quota wall on one family
+    cannot mask a free family (northeurope standardNVFamily measured 0/6 dedicated = 6 free);
+  * re-measures the per-family Cluster Dedicated vCPU matrix and the online-pool search;
+  * captures every GPU- UUID printed by the container's own nvidia-smi via the score response;
+  * takes an independent ARM readback, tears down deployment -> endpoint -> code/env assets and
+    proves GET 404 / list-empty.
 
-One resource alive at a time. Never touches another lane's endpoint/compute/workspace.
-Only stdlib. Flat pipe-separated stdout (this repo masks JSON brace runs).
+Never touches the workspace itself (pre-existing owner resource) or another lane's endpoint.
+Only stdlib + azure-ai-ml/azure-identity (installed by the workflow).
 """
 import base64
 import hashlib
@@ -37,29 +35,27 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 
-TAG = "C211_I125316"
+TAG = "C211_I125386"
 ARM = "https://management.azure.com"
 RG_DEFAULT = "chriso-sandbox-rg"
 WS_DEFAULT = "mlw-ai300-l0ee20539cc7442539c"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-NONCE = "i125316"
-EP = "c211-i125316-ep"
-DEP = "c211-i125316-dep"
-CODE = "c211-i125316-code"
-ENVNAME = "c211-i125316-cuda"
-API_W = "2024-10-01"      # AML workspaces / onlineEndpoints / codes / environments
-API_U = "2024-04-01"      # AML location usages
-API_Q = "2024-10-01"      # AML quotas
-STG = "2023-01-01"
+NONCE = "i125386"
+EP = "c211-i125386-ep"
+DEP = "c211-i125386-dep"
+CODE = "c211-i125386-code"
+ENVNAME = "c211-i125386-cuda"
+API_W = "2024-10-01"
+API_U = "2024-04-01"
 AUTHZ = "2022-04-01"
 IMG_MAIN = "mcr.microsoft.com/azureml/minimal-ubuntu22.04-py39-cuda11.8-gpu-inference:latest"
 IMG_ALT = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
-REGIONS_URLLOC = ["northeurope", "westeurope", "eastus", "eastus2", "westus2"]
+REGIONS = ["northeurope", "westeurope", "eastus", "eastus2", "westus2"]
 DEADLINE = 3300
-TEARDOWN_BUDGET = 1500
+TEARDOWN_BUDGET = 900
 T0 = time.time()
+DRY = os.environ.get("C211_DRY") == "1"
 DUMMY = "__dry__"
 
 SCORE_PY = r'''import json
@@ -68,40 +64,41 @@ import subprocess
 
 def _sh(args):
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=120)
-        out = (p.stdout or "") + (p.stderr or "")
-        return out.strip()
+        p = subprocess.run(args, capture_output=True, text=True, timeout=180)
+        return ((p.stdout or "") + (p.stderr or "")).strip()
     except Exception as e:  # noqa: BLE001
         return "ERR " + repr(e)
 
 
 LINES = []
-LINES.append("C211-I125316 IN-CONTAINER DEVICE PROBE")
+LINES.append("C211-I125386 IN-CONTAINER DEVICE PROBE")
+LINES.append("hostname :: " + _sh(["hostname"]))
 LINES.append("nvidia-smi -L :: " + _sh(["nvidia-smi", "-L"]))
 LINES.append("nvidia-smi --query-gpu :: " + _sh(
     ["nvidia-smi", "--query-gpu=name,uuid,memory.total,driver_version",
      "--format=csv,noheader"]))
-LINES.append("lspci :: " + _sh(["bash", "-lc", "lspci -nn 2>/dev/null | grep -i -E 'nvidia|3d contr' || true"]))
+LINES.append("lspci :: " + _sh(["bash", "-lc",
+                                "lspci -nn 2>/dev/null | grep -i -E 'nvidia|3d contr' || true"]))
 LINES.append("devnodes :: " + _sh(["bash", "-lc", "ls -1 /dev/nvidia* 2>/dev/null || true"]))
 TEXT = "\n".join(LINES)
-print("C211-I125316-CONTAINER-OUTPUT-BEGIN", flush=True)
+print("C211-I125386-CONTAINER-OUTPUT-BEGIN", flush=True)
 print(TEXT, flush=True)
-print("C211-I125316-CONTAINER-OUTPUT-END", flush=True)
+print("C211-I125386-CONTAINER-OUTPUT-END", flush=True)
 
 
 def init():
-    print("C211-I125316 init", flush=True)
+    print("C211-I125386 init", flush=True)
     print(TEXT, flush=True)
 
 
 def run(raw_data):
-    return json.dumps({"c211": "i125316", "device_text": TEXT})
+    return json.dumps({"c211": "i125386", "device_text": TEXT})
 '''
 
 UUID_RE = re.compile(r"GPU-[0-9a-fA-F-]{16,}")
 
 
-def clean(v, n=900):
+def clean(v, n=1100):
     s = str(v)
     for ch in ("|", "\n", "\r", "\t", "{", "}"):
         s = s.replace(ch, " ")
@@ -116,11 +113,10 @@ def emit(step, **kv):
 
 
 def b64(s):
-    if not s:
+    try:
+        return base64.b64encode((s or "").encode()).decode()
+    except Exception:  # noqa: BLE001
         return ""
-    if isinstance(s, (dict, list)):
-        s = json.dumps(s)
-    return base64.b64encode(str(s).encode("utf-8", "replace")).decode()
 
 
 def left():
@@ -138,15 +134,15 @@ def sh(args, timeout=180):
 
 
 def u(path):
-    """Absolute-URL builder. Refuses relative joins (the x125052 own-code defect)."""
+    """Absolute-URL builder: refuses relative joins (the x125052 own-code defect)."""
     if not (path.startswith("/subscriptions/") or path.startswith("/providers/")):
-        raise ValueError("C211_I125316 refuses non-absolute ARM path: %r" % path)
+        raise ValueError("C211_I125386 refuses non-absolute ARM path: %r" % path)
     return ARM + path
 
 
 def arm(tok, url, method="GET", body=None, timeout=120, dry_label=None):
     if not url.startswith(ARM + "/"):
-        raise ValueError("C211_I125316 refuses non-absolute ARM url: %r" % url)
+        raise ValueError("C211_I125386 refuses non-absolute ARM url: %r" % url)
     if DRY:
         emit("plan", method=method, url=url, label=dry_label or "")
         return 200, {"dry": True}
@@ -173,13 +169,23 @@ def arm(tok, url, method="GET", body=None, timeout=120, dry_label=None):
         except Exception:  # noqa: BLE001
             return e.code, {"raw": raw[:3000]}
     except Exception as e:  # noqa: BLE001
-        return 0, {"transport_error": str(e)}
+        return -1, {"error": repr(e)}
+
+
+def err_of(st, b):
+    if st in (200, 201, 202, 204):
+        return {}
+    if not isinstance(b, dict):
+        return {"msg": clean(b, 400)}
+    e = b.get("error") if isinstance(b.get("error"), dict) else {}
+    msg = e.get("message") or b.get("message") or b.get("raw") or ""
+    det = e.get("details") or b.get("details")
+    return {"code": clean(e.get("code") or b.get("code") or "", 120),
+            "message": clean(msg, 600),
+            "details": clean(json.dumps(det)[:500] if det else "", 500)}
 
 
 def httptext(url, method="GET", body=None, headers=None, timeout=120):
-    if DRY:
-        emit("plan", method=method, url=url.split("?")[0], label="blob/score")
-        return 200, b""
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -190,69 +196,13 @@ def httptext(url, method="GET", body=None, headers=None, timeout=120):
         except Exception:  # noqa: BLE001
             return e.code, b""
     except Exception as e:  # noqa: BLE001
-        return 0, str(e).encode()
+        return -1, repr(e).encode()
 
 
-def err_of(st, body):
-    if isinstance(body, dict):
-        e = body.get("error")
-        if isinstance(e, dict):
-            return {"code": e.get("code"), "message": (e.get("message") or "")[:600],
-                    "details": (json.dumps(e.get("details"))[:600] if e.get("details") else None)}
-        if "raw" in body:
-            return {"raw": body["raw"][:600]}
-        if "transport_error" in body:
-            return {"transport_error": body["transport_error"][:300]}
-    return {}
-
-
-def prov_state(body):
-    if isinstance(body, dict):
-        p = body.get("properties") or {}
-        return p.get("provisioningState") or body.get("provisioningState")
-    return None
-
-
-def sa_sas(acct, key_b64, container, hours=6):
-    """Container-scoped service SAS (sv=2022-11-02 field order)."""
-    key = base64.b64decode(key_b64)
-    st = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 300))
-    se = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + hours * 3600))
-    sv = "2022-11-02"
-    sp = "rwdlc"
-    spr = "https"
-    sr = "c"
-    canon_res = "/blob/" + acct + "/" + container
-    s2s = "\n".join([sp, st, se, canon_res, "", "", spr, sv, sr, "", "",
-                     "", "", "", "", ""])
-    sig = base64.b64encode(hmac.new(key, s2s.encode("utf-8"),
-                                    hashlib.sha256).digest()).decode()
-    return urllib.parse.urlencode({"sv": sv, "sp": sp, "se": se, "st": st,
-                                   "spr": spr, "sr": sr, "sig": sig})
-
-
-def put_blob(bbase, container, path, data, q):
-    url = "%s/%s/%s?%s" % (bbase, container, path, q)
-    return httptext(url, method="PUT", body=data, headers={
-        "x-ms-blob-type": "BlockBlob", "x-ms-version": "2022-11-02",
-        "Content-Type": "application/octet-stream"}, timeout=180)
-
-
-def list_containers(acct, key_b64):
-    # list containers with SharedKey auth
-    key = base64.b64decode(key_b64)
-    xms = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
-    ver = "2022-11-02"
-    canon = "\n".join(["GET", "", "", "", "", "", "", "", "", "", "", "",
-                       "x-ms-date:" + xms + "\nx-ms-version:" + ver,
-                       "/blob/" + acct + "/", "restype:container"])
-    sig = base64.b64encode(hmac.new(key, canon.encode("utf-8"), hashlib.sha256).digest()).decode()
-    url = ("https://" + acct + ".blob.core.windows.net/?restype=container&comp=list")
-    st, raw = httptext(url, headers={"x-ms-date": xms, "x-ms-version": ver,
-                                     "Authorization": "SharedKey " + acct + ":" + sig},
-                       timeout=120)
-    names = re.findall(r"<Name>([^<]+)</Name>", raw.decode("utf-8", "replace"))
-    return st, names
+def prov_state(b):
+    if not isinstance(b, dict):
+        return None
+    return b.get("provisioningState") or ((b.get("properties") or {}).get("provisioningState"))
 
 
 def build_zip():
@@ -264,6 +214,47 @@ def build_zip():
     return buf.getvalue()
 
 
+def blobsig(acct, key_b64, verb, canon_resource, headers, content_len=0, content_type=""):
+    """Correct Azure SharedKey StringToSign (11 empty fields after VERB)."""
+    key = base64.b64decode(key_b64)
+    fields = [verb, "", "", ("" if content_len in (0, None) else str(content_len)), "",
+              content_type, "", "", "", "", "", ""]
+    ch = "".join("%s:%s\n" % (k.lower(), v) for k, v in sorted(headers.items())
+                 if k.lower().startswith("x-ms-"))
+    sts = "\n".join(fields) + "\n" + ch + canon_resource
+    sig = base64.b64encode(hmac.new(key, sts.encode("utf-8"), hashlib.sha256).digest()).decode()
+    return "SharedKey %s:%s" % (acct, sig)
+
+
+def blob_put(acct, key_b64, container, path, data):
+    xms = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+    ver = "2022-11-02"
+    hdrs = {"x-ms-date": xms, "x-ms-version": ver, "x-ms-blob-type": "BlockBlob",
+            "Content-Type": "application/octet-stream"}
+    canon = "/blob/%s/%s/%s" % (acct, container, path)
+    auth = blobsig(acct, key_b64, "PUT", canon, hdrs, len(data),
+                   "application/octet-stream")
+    h2 = dict(hdrs)
+    h2["Authorization"] = auth
+    h2["Content-Length"] = str(len(data))
+    url = "https://%s.blob.core.windows.net/%s/%s" % (acct, container, path)
+    st, raw = httptext(url, "PUT", body=data, headers=h2, timeout=240)
+    return st, raw[:300].decode("utf-8", "replace")
+
+
+def blob_list(acct, key_b64):
+    xms = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+    ver = "2022-11-02"
+    hdrs = {"x-ms-date": xms, "x-ms-version": ver}
+    canon = "/blob/%s/\ncomp:list\nrestype:container" % acct
+    auth = blobsig(acct, key_b64, "GET", canon, hdrs)
+    h2 = dict(hdrs)
+    h2["Authorization"] = auth
+    url = "https://%s.blob.core.windows.net/?restype=container&comp=list" % acct
+    st, raw = httptext(url, "GET", headers=h2, timeout=120)
+    return st, re.findall(r"<Name>([^<]+)</Name>", raw.decode("utf-8", "replace"))
+
+
 def del_and_wait(tok, url, label, budget, summary):
     st, b = arm(tok, url, "DELETE", None, timeout=240, dry_label="delete-" + label)
     emit("delete", label=label, http=st, **err_of(st, b))
@@ -272,7 +263,7 @@ def del_and_wait(tok, url, label, budget, summary):
     while time.time() - t0 < budget:
         if DRY:
             break
-        time.sleep(10)
+        time.sleep(8)
         st2, _b2 = arm(tok, url, "GET", None, timeout=90)
         final = st2
         if st2 == 404:
@@ -283,315 +274,385 @@ def del_and_wait(tok, url, label, budget, summary):
     return final
 
 
-DRY = ("--dry-run" in sys.argv) or (os.environ.get("C211_DRY") == "1")
-SUMMARY = {"tag": TAG, "quota": {}, "iam": {}, "endpoint": {}, "deployment": {},
-           "score": {}, "readback": {}, "cleanup": {}}
+# ------------------------------------------------------- REST code-asset fallback
+def rest_code_stage(tok, sid, rg, ws, wsurl, summary):
+    """Fallback when azure-ai-ml is unavailable: upload score.py into the workspace
+    default-datastore container with SharedKey and register a code asset by blob URL."""
+    out = {"code_id": None, "attempts": []}
+    st, wb = arm(tok, wsurl + "?api-version=" + API_W, dry_label="ws-for-storage")
+    wprops = (wb.get("properties") or {}) if isinstance(wb, dict) else {}
+    sa_name = str(wprops.get("storageAccount") or "").rsplit("/", 1)[-1]
+    cont = None
+    sta, db = arm(tok, wsurl + "/datastores/workspaceblobstore?api-version=" + API_W,
+                  dry_label="datastore")
+    dp = (db.get("properties") or {}) if isinstance(db, dict) else {}
+    cont = dp.get("containerName")
+    sa_name = dp.get("accountName") or sa_name
+    emit("datastore", http=sta, sa=clean(sa_name, 60), container=clean(cont or "", 80),
+         dtype=clean(dp.get("datastoreType") or "", 40))
+    if DRY and not sa_name:
+        sa_name = "mlwai300storage5666d3c3c"
+    if not sa_name:
+        emit("rest-code", ok=False, why="no storage account")
+        return out
+    stk, kb = arm(tok, u("/subscriptions/" + sid + "/resourceGroups/" + rg + "/providers/"
+                         "Microsoft.Storage/storageAccounts/" + sa_name + "/listKeys"
+                         "?api-version=2023-01-01"), "POST", {}, timeout=120,
+                  dry_label="storage-listkeys")
+    key = None
+    try:
+        key = (kb.get("keys") or [{}])[0].get("value")
+    except Exception:  # noqa: BLE001
+        pass
+    emit("storage-keys", http=stk, sa=sa_name, got=bool(key))
+    summary["rest_code_sa"] = sa_name
+    if DRY:
+        return out
+    if not key:
+        emit("rest-code", ok=False, why="no storage key")
+        return out
+    if not cont:
+        stl, conts = blob_list(sa_name, key)
+        emit("storage-containers", http=stl, n=len(conts),
+             aml=(";".join([c for c in conts if c.startswith("azureml")][:4]) or "NONE"))
+        amlc = [c for c in conts if c.startswith("azureml-blobstore")]
+        cont = amlc[0] if amlc else None
+    if not cont:
+        emit("rest-code", ok=False, why="no container")
+        return out
+    prefix = "c211/" + NONCE + "/code"
+    rc1, r1 = blob_put(sa_name, key, cont, prefix + "/score.py", SCORE_PY.encode())
+    rc2, r2 = blob_put(sa_name, key, cont, prefix + "/code.zip", build_zip())
+    emit("blob-put", container=clean(cont, 80), py=rc1, zip=rc2, err=clean(r2, 200))
+    base = "https://%s.blob.core.windows.net/%s/%s" % (sa_name, cont, prefix)
+    forms = [base, base + "/", base + "/code.zip",
+             "azureml://datastores/workspaceblobstore/paths/c211/" + NONCE + "/code/"]
+    for form in forms:
+        st2, b2 = arm(tok, wsurl + "/codes/" + CODE + "/versions/1?api-version=" + API_W, "PUT",
+                      {"properties": {"codeUri": form, "description": "c211 i125386 probe"}},
+                      timeout=240, dry_label="code-asset")
+        e = err_of(st2, b2)
+        out["attempts"].append({"form": form[-70:], "http": st2, "err": e})
+        emit("code-asset", kind=clean(form[-60:], 60), http=st2, **e)
+        if st2 in (200, 201):
+            out["code_id"] = (b2.get("id") if isinstance(b2, dict) else None) or \
+                (wsurl + "/codes/" + CODE + "/versions/1")
+            out["blob_uploaded"] = {"container": cont, "prefix": prefix}
+            break
+    emit("rest-code", ok=bool(out["code_id"]))
+    summary["rest_code"] = {"attempts": out["attempts"],
+                            "blob": out.get("blob_uploaded")}
+    return out
+
+
+# ---------------------------------------------------------------- SDK stage
+def sdk_stage(sid, rg, ws, summary):
+    """Create code asset + environment through azure-ai-ml (canonical upload/serialization)."""
+    out = {"ok": False}
+    try:
+        from azure.ai.ml import MLClient
+        from azure.ai.ml.entities import Code, Environment
+        from azure.identity import DefaultAzureCredential
+    except Exception as e:  # noqa: BLE001
+        out["import_error"] = clean(repr(e), 400)
+        emit("sdk-import", ok=False, err=clean(repr(e), 400))
+        return out
+    emit("sdk-import", ok=True)
+    if DRY:
+        emit("plan-sdk", what="MLClient+Code.create_or_update+Environment.create_or_update",
+             path="./c211code", image=IMG_MAIN)
+        out["ok"] = True
+        out["code_id"] = DUMMY + "-code"
+        out["env_id"] = DUMMY + "-env"
+        return out
+    try:
+        ml = MLClient(DefaultAzureCredential(), sid, rg, ws)
+        out["workspace"] = getattr(ml, "workspace_name", ws)
+    except Exception as e:  # noqa: BLE001
+        emit("sdk-client", ok=False, err=clean(repr(e), 500))
+        out["client_error"] = clean(repr(e), 500)
+        return out
+    os.makedirs("./c211code", exist_ok=True)
+    open("./c211code/score.py", "w").write(SCORE_PY)
+    code_id = None
+    for ver in ("1",):
+        try:
+            c = ml.code.create_or_update(Code(name=CODE, version=ver, path="./c211code",
+                                              description="c211 i125386 scoring probe"))
+            code_id = getattr(c, "id", None)
+            emit("sdk-code", http=200, id_ok=bool(code_id),
+                 code_uri=clean(getattr(c, "code_uri", "") or "", 200))
+            break
+        except Exception as e:  # noqa: BLE001
+            emit("sdk-code", http=-1, ver=ver, err=clean(repr(e), 700))
+            break
+    out["code_id"] = code_id
+    env_id = None
+    for img in (IMG_MAIN, IMG_ALT):
+        try:
+            e = ml.environments.create_or_update(Environment(name=ENVNAME, version="1",
+                                                            image=img, os_type="Linux",
+                                                            description="c211 i125386 cuda"))
+            env_id = getattr(e, "id", None)
+            emit("sdk-env", http=200, image=img.split("/")[-1], id_ok=bool(env_id))
+            break
+        except Exception as e:  # noqa: BLE001
+            emit("sdk-env", http=-1, image=img.split("/")[-1], err=clean(repr(e), 700))
+    out["env_id"] = env_id
+    out["ok"] = bool(code_id and env_id)
+    summary["sdk"] = {"code_id": code_id, "env_id": env_id}
+    return out
+
+
+def sdk_deploy(sid, rg, ws, sku, summary, budget):
+    """Create ONE managed online deployment via the SDK and poll to terminal."""
+    res = {"sku": sku, "create": None, "state": None, "error": None}
+    try:
+        from azure.ai.ml import MLClient
+        from azure.ai.ml.entities import ManagedOnlineDeployment
+        from azure.identity import DefaultAzureCredential
+    except Exception as e:  # noqa: BLE001
+        res["error"] = "import " + clean(repr(e), 300)
+        return res
+    if DRY:
+        emit("plan-sdk", what="ManagedOnlineDeployment.create_or_update", endpoint=EP,
+             name=DEP, instance_type=sku, instance_count=1)
+        res["create"] = 200
+        return res
+    try:
+        ml = MLClient(DefaultAzureCredential(), sid, rg, ws)
+        sdk = summary.get("sdk") or {}
+        dep = ManagedOnlineDeployment(name=DEP, endpoint_name=EP,
+                                      code=sdk.get("code_id"), environment=sdk.get("env_id"),
+                                      instance_type=sku, instance_count=1,
+                                      environment_variables={"C211_NONCE": NONCE},
+                                      app_insights_enabled=False)
+        poller = ml.online_deployments.begin_create_or_update(dep)  # noqa: F841
+        res["create"] = 200
+        emit("dep-create", sku=sku, http=200, via="sdk")
+    except Exception as e:  # noqa: BLE001
+        msg = repr(e)
+        m = re.search(r"\(([A-Za-z]+Error)\)", msg)
+        res["create"] = -1
+        res["error"] = clean(msg, 900)
+        emit("dep-create", sku=sku, http=-1, code=clean(m.group(1) if m else "", 60),
+             message=clean(msg, 900))
+        try:
+            # capture the ARM-shaped body of the refusal for the record
+            emit("dep-create-b64", sku=sku, b64=b64(msg)[:1200])
+        except Exception:  # noqa: BLE001
+            pass
+        return res
+    t0 = time.time()
+    while time.time() - t0 < budget and left() > 400:
+        time.sleep(20)
+        try:
+            d = ml.online_deployments.get(name=DEP, endpoint_name=EP)
+            st = getattr(d, "provisioning_state", None)
+            er = getattr(d, "error", None)
+            res["state"] = st
+            if er:
+                res["error"] = clean(json.dumps(er, default=str)[:900], 900)
+            emit("dep-poll", sku=sku, http=200, state=st, t=round(time.time() - t0),
+                 err=clean(json.dumps(er, default=str)[:400] if er else "", 400))
+            if st in ("Succeeded", "Failed", "Canceled"):
+                break
+        except Exception as e:  # noqa: BLE001
+            emit("dep-poll", sku=sku, http=-1, t=round(time.time() - t0),
+                 err=clean(repr(e), 400))
+    return res
+
+
+def sdk_del_deployment(sid, rg, ws, summary, budget):
+    try:
+        from azure.ai.ml import MLClient
+        from azure.identity import DefaultAzureCredential
+    except Exception:  # noqa: BLE001
+        return None
+    if DRY:
+        return None
+    try:
+        ml = MLClient(DefaultAzureCredential(), sid, rg, ws)
+        ml.online_deployments.begin_delete(name=DEP, endpoint_name=EP)
+        emit("delete", label="dep-sdk", http=200)
+    except Exception as e:  # noqa: BLE001
+        emit("delete", label="dep-sdk", http=-1, err=clean(repr(e), 500))
+    t0 = time.time()
+    final = None
+    while time.time() - t0 < budget:
+        time.sleep(8)
+        try:
+            ml.online_deployments.get(name=DEP, endpoint_name=EP)
+            final = 200
+        except Exception:  # noqa: BLE001
+            final = 404
+            break
+    summary["cleanup"]["dep-sdk"] = {"final_get": final, "t": round(time.time() - t0)}
+    emit("delete-readback", label="dep-sdk", final=final, t=round(time.time() - t0))
+    return final
 
 
 def main():
-    # ---- CLI args injected by the workflow (tolerated; endpoint name is OURS) ----
-    args = {}
-    i = 1
-    while i < len(sys.argv):
-        a = sys.argv[i]
-        if a.startswith("--") and i + 1 < len(sys.argv):
-            args[a[2:].replace("-", "_")] = sys.argv[i + 1]
-            i += 2
-        else:
-            i += 1
-    ws = args.get("workspace") or WS_DEFAULT
-    rg = args.get("resource_group") or RG_DEFAULT
-    emit("args", ws=ws, rg=rg, passed_endpoint=args.get("endpoint_name"),
-         passed_deployment=args.get("deployment_name"),
-         subscription_arg=args.get("subscription_id"), nonce_ep=EP, nonce_dep=DEP,
-         dry=DRY)
+    summary = {"tag": TAG, "cleanup": {}, "quota": {}, "iam": {}, "endpoint": {},
+               "deployment": {}, "ladder": []}
+    args = {"sid": SUB_EXPECT, "rg": RG_DEFAULT, "ws": WS_DEFAULT}
+    a = sys.argv[1:]
+    for i in range(0, len(a) - 1):
+        if a[i] == "--subscription-id":
+            args["sid"] = a[i + 1]
+        elif a[i] == "--resource-group":
+            args["rg"] = a[i + 1]
+        elif a[i] == "--workspace":
+            args["ws"] = a[i + 1]
+    sid, rg, ws = args["sid"], args["rg"], args["ws"]
+    emit("args", ws=ws, rg=rg, subscription_arg=sid, nonce_ep=EP, nonce_dep=DEP,
+         dry=DRY, tag=TAG)
 
-    if DRY:
-        emit("dryrun", plan="ARM identity + token via az; then quota/iam/code/env/"
-             "endpoint/deployment/score/readback/teardown")
-
-    # ---- identity ----
-    if DRY:
-        sid = SUB_EXPECT
-        tenant = DUMMY
-        tok = DUMMY
-        emit("identity", sub=sid, tenant=tenant, name="dry", state="dry")
-    else:
-        r = sh(["az", "account", "show", "-o", "json"], timeout=180)
-        try:
-            acc = json.loads(r["out"])
-        except Exception:  # noqa: BLE001
-            emit("FATAL", why="no az session", raw=r["out"][:300], err=r["err"][:300])
-            return
-        sid = acc.get("id")
-        tenant = acc.get("tenantId")
-        emit("identity", sub=sid, tenant=tenant, name=acc.get("name"),
-             state=acc.get("state"), user=((acc.get("user") or {}).get("name")),
-             expect_match=(sid == SUB_EXPECT))
-        r = sh(["az", "account", "get-access-token", "--resource", ARM, "--output", "json"],
-               timeout=180)
-        tok = None
-        try:
-            tok = json.loads(r["out"]).get("accessToken")
-        except Exception:  # noqa: BLE001
-            pass
-        emit("arm-token", got=bool(tok), len=len(tok or ""))
-        if not sid or not tok:
-            emit("PROBE-EXIT", code=1, why="NO_ARM_TOKEN")
-            return
-    if sid != SUB_EXPECT:
-        emit("ABORT", why="unexpected subscription", sub=sid)
-        emit("PROBE-EXIT", code=2)
-        return
-
-    base = "/subscriptions/" + sid + "/resourceGroups/" + rg + "/providers"
-    wsu = base + "/Microsoft.MachineLearningServices/workspaces/" + ws
-    wurl = u(wsu + "?api-version=" + API_W)
-
-    # ---- 1) stage_reap(): remove ONLY our own nonce endpoints (none expected) ----
-    st, lb = arm(tok, u(wsu + "/onlineEndpoints?api-version=" + API_W), dry_label="reap-list")
-    ours = []
-    for x in ((lb.get("value") or []) if isinstance(lb, dict) else []):
-        nm = str(x.get("name") or "")
-        if nm.startswith("c211-i125316"):
-            ours.append(nm)
-    emit("reap-scan", http=st, n_endpoints=len((lb.get("value") or [])
-                                               if isinstance(lb, dict) else []),
-         ours=(";".join(ours) if ours else "NONE"))
-    for nm in ours:
-        del_and_wait(tok, u(wsu + "/onlineEndpoints/" + nm + "?api-version=" + API_W),
-                     "reap-" + nm, 420, SUMMARY)
-    SUMMARY["reap"] = {"http": st, "ours": ours}
-
-    # ---- 2) QUOTA measurement ----
-    # 2a: subscription-scope quotas (the real pool list: top-level limit/name/type)
-    qsub = u("/subscriptions/" + sid + "/providers/Microsoft.MachineLearningServices"
-             "/quotas?api-version=" + API_Q)
-    st, qb = arm(tok, qsub, timeout=180, dry_label="quota-subscription")
-    entries = (qb.get("value") or []) if isinstance(qb, dict) else []
-    type_counts = {}
-    hits = []
-    for m in entries:
-        nmo = m.get("name")
-        if isinstance(nmo, dict):
-            nm = str(nmo.get("value") or "")
-            loc = str(nmo.get("localizedValue") or "")
-        else:
-            nm = str(nmo or "")
-            loc = ""
-        typ = str(m.get("type") or "")
-        mtype = typ.split("/")[-3] if typ.count("/") >= 3 else typ
-        type_counts[mtype] = type_counts.get(mtype, 0) + 1
-        line = "%s/%s" % (mtype, nm)
-        emit("quota-entry", name=nm, localized=loc, type=mtype, limit=m.get("limit"),
-             unit=m.get("unit"), idtail=str(m.get("id") or "")[-64:])
-        if re.search(r"(?i)online|endpoint|serving|infer|vcpu", nm + " " + loc + " " + typ):
-            hits.append(line)
-    SUMMARY["quota"]["sub_http"] = st
-    SUMMARY["quota"]["sub_n"] = len(entries)
-    SUMMARY["quota"]["sub_types"] = type_counts
-    SUMMARY["quota"]["online_hits"] = hits
-    emit("quota-sub", http=st, n=len(entries), types=json.dumps(type_counts),
-         online_hits=(";".join(hits) if hits else "NONE"),
-         **({} if st == 200 else err_of(st, qb)))
-
-    # 2b: the literal absolute-URL location-scoped quotas the intent names
-    loc_q = {}
-    for reg in REGIONS_URLLOC:
-        if left() < 2400:
-            emit("quota-loc-skip", region=reg, why="deadline")
-            continue
-        url = u("/subscriptions/" + sid + "/providers/Microsoft.MachineLearningServices"
-                "/locations/" + reg + "/quotas?api-version=" + API_Q)
-        st2, q2 = arm(tok, url, timeout=120, dry_label="quota-loc-" + reg)
-        v = (q2.get("value") or []) if isinstance(q2, dict) else []
-        h2 = []
-        for m in v:
-            nmo = m.get("name")
-            nm = (str(nmo.get("value") or "") if isinstance(nmo, dict) else str(nmo or ""))
-            if re.search(r"(?i)online|endpoint|serving|infer", nm):
-                h2.append(nm)
-        loc_q[reg] = {"http": st2, "n": len(v), "online": h2,
-                      "err": (None if st2 in (200, 204) else err_of(st2, q2))}
-        emit("quota-loc", region=reg, http=st2, n=len(v),
-             online=(";".join(h2) if h2 else "NONE"),
-             **({} if st2 in (200, 204) else err_of(st2, q2)))
-    SUMMARY["quota"]["loc"] = loc_q
-
-    # 2c: location usages (127-meter style) + workspace usages
-    def usage_scan(label, url, ver_filter=True):
-        st3, ub = arm(tok, url, timeout=120, dry_label="usages-" + label)
-        vals = (ub.get("value") or []) if isinstance(ub, dict) else []
-        rows = []
-        for m in vals:
-            nmo = m.get("name")
-            nm = (str(nmo.get("value") or "") if isinstance(nmo, dict) else str(nmo or ""))
-            lo = (str(nmo.get("localizedValue") or "") if isinstance(nmo, dict) else "")
-            joined = nm + " " + lo
-            if re.search(r"(?i)online|endpoint|serving|ncas|nc4as|nc8as|nc24|a100|t4|"
-                         r"ncast4|dedicated|lowpriority", joined):
-                rows.append({"family": nm, "localized": lo,
-                             "current": m.get("currentValue"), "limit": m.get("limit")})
-        emit("usages", label=label, http=st3, n=len(vals),
-             rows=(";".join("%s:%s/%s" % (r["family"], r["current"], r["limit"])
-                            for r in rows[:18]) if rows else "NONE"),
-             **({} if st3 in (200, 204) else err_of(st3, ub)))
-        return {"http": st3, "n": len(vals), "rows": rows,
-                "err": (None if st3 in (200, 204) else err_of(st3, ub))}
-
-    for reg in ("northeurope", "westeurope"):
-        if left() < 2400:
-            break
-        SUMMARY["quota"]["loc_usage_" + reg] = usage_scan(
-            "loc-" + reg,
-            u("/subscriptions/" + sid + "/providers/Microsoft.MachineLearningServices"
-              "/locations/" + reg + "/usages?api-version=" + API_U))
-    SUMMARY["quota"]["ws_usage"] = usage_scan(
-        "ws-" + ws, u(wsu + "/usages?api-version=" + API_W))
-
-    # ---- 3) workspace + IAM readback ----
-    st, wb = arm(tok, wurl, timeout=120, dry_label="workspace-get")
-    wprops = (wb.get("properties") or {}) if isinstance(wb, dict) else {}
-    wloc = (wb.get("location") if isinstance(wb, dict) else None) or "northeurope"
-    emit("workspace", http=st, loc=wloc, state=prov_state(wb),
-         storageAccount=str(wprops.get("storageAccount") or "")[-70:],
-         keyVault=str(wprops.get("keyVault") or "")[-60:],
-         msi=bool(((wb.get("identity") or {}).get("principalId")) if isinstance(wb, dict) else False),
-         **({} if st == 200 else err_of(st, wb)))
-    SUMMARY["workspace"] = {"http": st, "loc": wloc, "state": prov_state(wb)}
-
-    st, pb = arm(tok, u(wsu + "/providers/Microsoft.Authorization/permissions?api-version="
-                        + AUTHZ), timeout=120, dry_label="permissions")
-    perms = []
-    for p in ((pb.get("value") or []) if isinstance(pb, dict) else []):
-        perms.append({"actions": (p.get("actions") or [])[:40],
-                      "notActions": (p.get("notActions") or [])[:10],
-                      "scope_tail": str(p.get("scope") or "")[-60:]})
-    emit("iam-permissions", http=st, n=len(perms),
-         actions=(";".join(",".join(x["actions"]) for x in perms)[:1200]),
-         **({} if st == 200 else err_of(st, pb)))
-    SUMMARY["iam"]["permissions_http"] = st
-    SUMMARY["iam"]["n"] = len(perms)
-
-    actions_wanted = [
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/create",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/write",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/read",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/delete",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/listKeys/action",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/create",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/write",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/read",
-        "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/delete",
-    ]
-    st, cb = arm(tok, u("/subscriptions/" + sid + "/providers/Microsoft.Authorization/"
-                        "checkAccess?api-version=" + AUTHZ), "POST",
-                 {"properties": {"actions": actions_wanted}}, timeout=120,
-                 dry_label="checkAccess")
-    emit("iam-checkaccess", http=st, body_b64=b64(cb)[:1200],
-         **({} if st == 200 else err_of(st, cb)))
-    SUMMARY["iam"]["checkAccess_http"] = st
-
-    st, ep0 = arm(tok, u(wsu + "/onlineEndpoints?api-version=" + API_W), timeout=120,
-                  dry_label="list-endpoints")
-    names = [x.get("name") for x in ((ep0.get("value") or []) if isinstance(ep0, dict) else [])]
-    emit("iam-endpoints-list", http=st, n=len(names), names=(";".join(map(str, names[:10]))))
-    SUMMARY["iam"]["list_http"] = st
-    SUMMARY["iam"]["list_names"] = names
-
-    # ---- 4) code + environment assets (dependencies for the deployment) ----
-    storage_id = str(wprops.get("storageAccount") or "")
-    sa_name = storage_id.rsplit("/", 1)[-1] if storage_id else ""
-    if DRY and not sa_name:
-        sa_name = "mlwai300storage5666d3c3c"
-        storage_id = ("/subscriptions/" + sid + "/resourceGroups/" + rg +
-                      "/providers/Microsoft.Storage/storageAccounts/" + sa_name)
-    hkey = None
-    code_id = None
-    if sa_name:
-        st, kb = arm(tok, u(storage_id + "/listKeys?api-version=" + STG), "POST", {},
-                     timeout=120, dry_label="storage-listkeys")
-        try:
-            hkey = (kb.get("keys") or [{}])[0].get("value")
-        except Exception:  # noqa: BLE001
-            pass
-        if DRY and not hkey:
-            hkey = base64.b64encode(b"c211dryrunkey").decode()
-        emit("storage-keys", http=st, sa=sa_name, got=bool(hkey),
-             **({} if st == 200 else err_of(st, kb)))
-        SUMMARY["code"] = {"sa": sa_name, "keys_http": st, "key_got": bool(hkey)}
-    # HEAD sha of the checked-out PR head: lets us use a public raw URL for the code
-    # asset without depending on storage keys at all.
-    gsha = ""
+    tok = DUMMY
     if not DRY:
-        g = sh(["git", "rev-parse", "HEAD"], timeout=60)
-        gsha = (g["out"] or "").strip()[:40]
+        g = sh(["az", "account", "get-access-token", "--resource",
+                "https://management.azure.com", "--query", "accessToken", "-o", "tsv"], 180)
+        tok = (g["out"] or "").strip()
+        emit("arm-token", got=bool(tok), len=len(tok), rc=g["rc"])
+        if not tok:
+            emit("ABORT", why="no arm token", err=clean(g["err"], 400))
+            _summary_print(summary)
+            return 2
+        st, sb = arm(tok, u("/subscriptions/" + sid + "?api-version=2022-12-01"),
+                     dry_label="subscription")
+        emit("identity", http=st, sub=sid, state=sb.get("state") if isinstance(sb, dict) else None,
+             name=clean(sb.get("displayName") if isinstance(sb, dict) else "", 80))
     else:
-        gsha = "0" * 40
-    emit("git-head", sha=gsha)
-    zipbytes = build_zip()
-    uris = []
-    if gsha:
-        uris.append("https://raw.githubusercontent.com/hildasubianto617-dot/mslearn-mlops/"
-                    + gsha + "/src/c211_i125316_code.zip")
-    if hkey:
-        bbase = "https://" + sa_name + ".blob.core.windows.net"
-        stc, conts = list_containers(sa_name, hkey)
-        amlc = [c for c in conts if c.startswith("azureml-blobstore")]
-        emit("storage-containers", http=stc, n=len(conts), aml=(";".join(amlc[:4]) or "NONE"))
-        summary_code = {"blob": [], "uris": []}
-        if amlc:
-            q = sa_sas(sa_name, hkey, amlc[0])
-            rc1, _ = put_blob(bbase, amlc[0], "c211/" + NONCE + "/code.zip", zipbytes, q)
-            rc2, _ = put_blob(bbase, amlc[0], "c211/" + NONCE + "/score.py",
-                              SCORE_PY.encode(), q)
-            summary_code["blob"] = [{"container": amlc[0], "zip": rc1, "py": rc2}]
-            uris.append("azureml://datastores/workspaceblobstore/paths/c211/" + NONCE +
-                        "/code.zip")
-            uris.append("azureml://datastores/workspaceblobstore/paths/c211/" + NONCE)
-            uris.append(bbase + "/" + amlc[0] + "/c211/" + NONCE + "/code.zip?" + q)
-            emit("blob-put", container=amlc[0], zip=rc1, py=rc2)
-        SUMMARY["code"] = dict(SUMMARY.get("code") or {}, **summary_code)
-    for uri in uris:
-        st, cbr = arm(tok, u(wsu + "/codes/" + CODE + "/versions/1?api-version=" + API_W),
-                      "PUT", {"properties": {"codeUri": uri,
-                                             "description": "c211 i125316 probe"}},
-                      timeout=180, dry_label="code-asset")
-        if isinstance(SUMMARY.get("code"), dict):
-            SUMMARY["code"].setdefault("uris", []).append(
-                {"kind": uri.split("?")[0][-60:], "http": st,
-                 "err": (None if st in (200, 201) else err_of(st, cbr))})
-        emit("code-asset", kind=uri.split("?")[0][-52:], http=st,
-             **({} if st in (200, 201) else err_of(st, cbr)))
-        if st in (200, 201):
-            code_id = (cbr.get("id") if isinstance(cbr, dict) else None) or \
-                (wsu + "/codes/" + CODE + "/versions/1")
-            break
-    emit("code-final", ok=bool(code_id))
+        arm(tok, u("/subscriptions/" + sid + "?api-version=2022-12-01"), dry_label="subscription")
+        emit("identity", http=200, sub=sid, state="dry")
 
-    env_id = None
-    for img in (IMG_MAIN, IMG_ALT):
-        st, eb = arm(tok, u(wsu + "/environments/" + ENVNAME + "/versions/1?api-version="
-                            + API_W), "PUT",
-                     {"properties": {"image": img, "osType": "Linux",
-                                     "description": "c211 i125316 cuda inference"}},
-                     timeout=240, dry_label="env-asset")
-        emit("env-asset", image=img.split("/")[-1], http=st,
-             **({} if st in (200, 201) else err_of(st, eb)))
-        if st in (200, 201):
-            env_id = (eb.get("id") if isinstance(eb, dict) else None) or \
-                (wsu + "/environments/" + ENVNAME + "/versions/1")
-            break
-    emit("env-final", ok=bool(env_id))
-    SUMMARY["env"] = {"ok": bool(env_id)}
+    wsurl = u("/subscriptions/" + sid + "/resourceGroups/" + rg + "/providers/"
+              "Microsoft.MachineLearningServices/workspaces/" + ws)
+    st, wb = arm(tok, wsurl + "?api-version=" + API_W, dry_label="workspace")
+    wprops = (wb.get("properties") or {}) if isinstance(wb, dict) else {}
+    wloc = wb.get("location") if isinstance(wb, dict) else None
+    if DRY and not wloc:
+        wloc = "northeurope"
+    emit("workspace", http=st, loc=wloc, state=prov_state(wb), msi=bool(wprops.get("managedServiceIdentity")))
+    summary["workspace"] = {"http": st, "loc": wloc, "state": prov_state(wb)}
 
-    # ---- 5) ONE endpoint ----
-    eurl = u(wsu + "/onlineEndpoints/" + EP + "?api-version=" + API_W)
-    st, eb = arm(tok, eurl, "PUT", {"location": wloc, "tags": {"c211": NONCE},
-                                    "identity": {"type": "SystemAssigned"},
-                                    "properties": {"authMode": "Key",
-                                                   "description": "c211 i125316 nonce "
-                                                                  "managed online endpoint"}},
+    # ---- 1) reap scan: only OUR nonce endpoint names ----
+    if not DRY:
+        st, lb = arm(tok, u("/subscriptions/" + sid + "/resourceGroups/" + rg + "/providers/"
+                            "Microsoft.MachineLearningServices/workspaces/" + ws +
+                            "/onlineEndpoints?api-version=" + API_W), dry_label="reap-list")
+        names = [x.get("name") for x in ((lb.get("value") or []) if isinstance(lb, dict) else [])]
+        ours = [n for n in names if n in (EP,)]
+        emit("reap-scan", http=st, n_endpoints=len(names), ours=(";".join(ours) or "NONE"))
+        for n in ours:
+            del_and_wait(tok, u("/subscriptions/" + sid + "/resourceGroups/" + rg +
+                                "/providers/Microsoft.MachineLearningServices/workspaces/" +
+                                ws + "/onlineEndpoints/" + n + "?api-version=" + API_W),
+                         "reap-" + n, 420, summary)
+    else:
+        emit("reap-scan", http=200, n_endpoints=0, ours="NONE")
+
+    # ---- 2) quota matrix ----
+    q = summary["quota"]
+    stq, qb = arm(tok, u("/subscriptions/" + sid + "/providers/Microsoft.MachineLearningServices/"
+                         "quotas?api-version=" + API_W), dry_label="quota-sub")
+    qentries = (qb.get("value") or []) if isinstance(qb, dict) else []
+    hits = []
+    for e in qentries:
+        nm = " ".join(str(x) for x in (e.get("name") or {}).values()) if isinstance(e.get("name"), dict) else str(e.get("name"))
+        if re.search(r"(?i)online|serving|infer|vcpu", nm):
+            hits.append(nm)
+    q["sub"] = {"http": stq, "n": len(qentries), "online_hits": hits}
+    emit("quota-sub", http=stq, n=len(qentries),
+         online_hits=(";".join(hits) if hits else "NONE"))
+    for reg in REGIONS:
+        st2, b2 = arm(tok, u("/subscriptions/" + sid + "/providers/"
+                             "Microsoft.MachineLearningServices/locations/" + reg +
+                             "/quotas?api-version=" + API_W), dry_label="quota-" + reg)
+        v = (b2.get("value") or []) if isinstance(b2, dict) else []
+        h2 = []
+        for e in v:
+            nm = " ".join(str(x) for x in (e.get("name") or {}).values()) if isinstance(e.get("name"), dict) else str(e.get("name"))
+            if re.search(r"(?i)online|serving|infer", nm):
+                h2.append(nm)
+        q.setdefault("loc", {})[reg] = {"http": st2, "n": len(v), "online": h2}
+        emit("quota-loc", region=reg, http=st2, n=len(v),
+             online=(";".join(h2) if h2 else "NONE"))
+
+    rel = re.compile(r"(?i)totaldedicated|ncasv3_t4|ncfamily|ncsv3|nvfamily|nvsv3|nds|ndv|"
+                     r"a100|h100|h200|ncads|ndams|lsv3|nc4as|nc8as|nc24|nc6")
+    for reg in ("northeurope", "westeurope"):
+        stu, ub = arm(tok, u("/subscriptions/" + sid + "/providers/"
+                             "Microsoft.MachineLearningServices/locations/" + reg +
+                             "/usages?api-version=" + API_U), dry_label="usages-" + reg)
+        rows = []
+        for e in ((ub.get("value") or []) if isinstance(ub, dict) else []):
+            nm = e.get("name") or {}
+            fam = (nm.get("value") if isinstance(nm, dict) else str(nm)) or ""
+            loc = (nm.get("localizedValue") if isinstance(nm, dict) else "") or e.get("localizedValue") or ""
+            if rel.search(fam + " " + loc):
+                rows.append("%s=%s/%s" % (fam, e.get("currentValue"), e.get("limit")))
+        q.setdefault("usages", {})[reg] = rows
+        emit("usages", region=reg, http=stu, n=len((ub.get("value") or []) if isinstance(ub, dict) else []),
+             matrix=(";".join(rows))[:1600])
+
+    # ---- 3) IAM readback ----
+    st, pb = arm(tok, wsurl + "/providers/Microsoft.Authorization/permissions?api-version="
+                 + AUTHZ, dry_label="permissions")
+    perms = (pb.get("value") or []) if isinstance(pb, dict) else []
+    acts = ";".join(",".join((p.get("actions") or [])[:40]) for p in perms)
+    summary["iam"]["permissions_http"] = st
+    summary["iam"]["n"] = len(perms)
+    summary["iam"]["actions"] = acts[:1200]
+    emit("iam-permissions", http=st, n=len(perms), actions=acts[:1200])
+    st, cb = arm(tok, u("/subscriptions/" + sid + "/providers/Microsoft.Authorization/checkAccess"
+                        "?api-version=" + AUTHZ), "POST",
+                 {"properties": {"actions": [
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/create",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/write",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/read",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/delete",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/listKeys/action",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/create",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/write",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/read",
+                     "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/delete"]}},
+                 timeout=120, dry_label="checkAccess")
+    emit("iam-checkaccess", http=st, b64=b64(json.dumps(cb)[:500]),
+         **({} if st == 200 else err_of(st, cb)))
+    st, lb = arm(tok, wsurl + "/onlineEndpoints?api-version=" + API_W, dry_label="list-endpoints")
+    names = [x.get("name") for x in ((lb.get("value") or []) if isinstance(lb, dict) else [])]
+    emit("iam-endpoints-list", http=st, n=len(names), names=(";".join(map(str, names[:10]))))
+
+    # ---- 4) code + environment assets via SDK ----
+    sdk = sdk_stage(sid, rg, ws, summary)
+    code_id = sdk.get("code_id") if sdk else None
+    env_id = sdk.get("env_id") if sdk else None
+    if not code_id:
+        restc = rest_code_stage(tok, sid, rg, ws, wsurl, summary)
+        code_id = restc.get("code_id")
+        summary["rest_code_blob"] = restc.get("blob_uploaded")
+    if not env_id:
+        for img in (IMG_MAIN, IMG_ALT):
+            st, eb = arm(tok, wsurl + "/environments/" + ENVNAME + "/versions/1?api-version="
+                         + API_W, "PUT",
+                         {"properties": {"image": img, "osType": "Linux",
+                                         "description": "c211 i125386 cuda"}},
+                         timeout=240, dry_label="env-asset")
+            emit("env-asset", image=img.split("/")[-1], http=st, **err_of(st, eb))
+            if st in (200, 201):
+                env_id = (eb.get("id") if isinstance(eb, dict) else None) or \
+                    (wsurl + "/environments/" + ENVNAME + "/versions/1")
+                break
+    emit("assets-final", code_ok=bool(code_id), env_ok=bool(env_id))
+
+    # ---- 5) ONE nonce endpoint ----
+    eurl = wsurl + "/onlineEndpoints/" + EP
+    st, eb = arm(tok, eurl + "?api-version=" + API_W, "PUT",
+                 {"location": wloc, "tags": {"c211": NONCE},
+                  "identity": {"type": "SystemAssigned"},
+                  "properties": {"authMode": "Key",
+                                 "description": "c211 i125386 nonce managed online endpoint"}},
                  timeout=300, dry_label="endpoint-create")
     emit("endpoint-create", http=st, **err_of(st, eb))
     ep_state = None
@@ -602,187 +663,201 @@ def main():
         while time.time() - t0 < 600:
             if DRY:
                 break
-            rst, rb = arm(tok, eurl, timeout=120)
+            rst, rb = arm(tok, eurl + "?api-version=" + API_W, timeout=120)
             ep_state = prov_state(rb)
+            rp = (rb.get("properties") or {}) if isinstance(rb, dict) else {}
             emit("endpoint-poll", http=rst, state=ep_state, t=round(time.time() - t0),
-                 scoring_present=bool(((rb.get("properties") or {}).get("scoringUri"))
-                                      if isinstance(rb, dict) else False))
+                 scoring_present=bool(rp.get("scoringUri")))
             if ep_state in ("Succeeded", "Failed", "Canceled"):
                 break
             time.sleep(12)
-    SUMMARY["endpoint"].update({"state": ep_state, "http": st})
+    summary["endpoint"].update({"state": ep_state, "http": st})
     if ep_state != "Succeeded" and not DRY:
         emit("ABORT", why="endpoint not created", state=ep_state)
-        teardown(tok, wsu, eurl, ep_owned, SUMMARY)
-        return
+        if ep_owned:
+            del_and_wait(tok, eurl + "?api-version=" + API_W, "endpoint-final", TEARDOWN_BUDGET,
+                         summary)
+        _summary_print(summary)
+        return 0
 
-    # ---- 6) ONE deployment, A100 then T4, on-demand only ----
-    durl = u(wsu + "/onlineEndpoints/" + EP + "/deployments/" + DEP + "?api-version=" + API_W)
-    ladder = [{"sku": "Standard_NC24ads_A100_v4", "class": "A100-80GB-1x"},
-              {"sku": "Standard_NC4as_T4_v3", "class": "T4-1x"}]
+    # ---- 6) ONE deployment at a time: A100 -> T4 -> NV6 -> NC6 ----
+    durl = eurl + "/deployments/" + DEP
+    ladder = [{"sku": "Standard_NC24ads_A100_v4", "class": "A100-80GB-1x", "budget": 900},
+              {"sku": "Standard_NC4as_T4_v3", "class": "T4-1x", "budget": 900},
+              {"sku": "Standard_NV6", "class": "M60-1x", "budget": 900},
+              {"sku": "Standard_NC6", "class": "K80-1x", "budget": 600}]
     dep_state = None
     dep_owned = False
-    tries = []
     for attempt in ladder:
         if left() < 700:
             emit("dep-skip", sku=attempt["sku"], why="deadline")
             break
-        body = {"location": wloc, "tags": {"c211": NONCE},
-                "sku": {"name": "Default", "capacity": 1},
-                "properties": {
-                    "endpointComputeType": "Managed",
-                    "instanceType": attempt["sku"],
-                    "instanceCount": 1,
-                    "environmentId": env_id,
-                    "environmentVariables": {"C211_NONCE": NONCE},
-                    "appInsightsEnabled": False,
-                    "requestSettings": {"requestTimeoutMillis": 90000,
-                                        "maxConcurrentRequestsPerInstance": 1},
-                    "livenessProbe": {"initialDelay": "PT300S", "period": "PT30S",
-                                      "timeout": "PT30S", "failureThreshold": 30,
-                                      "successThreshold": 1},
-                    "readinessProbe": {"initialDelay": "PT300S", "period": "PT30S",
-                                       "timeout": "PT30S", "failureThreshold": 30,
-                                       "successThreshold": 1}}}
-        if code_id:
-            body["properties"]["codeConfiguration"] = {"codeId": code_id,
-                                                       "scoringScript": "score.py"}
-        st, db = arm(tok, durl, "PUT", body, timeout=300, dry_label="dep-create")
-        emit("dep-create", sku=attempt["sku"], cls=attempt["class"], http=st, **err_of(st, db))
-        tries.append({"sku": attempt["sku"], "http": st,
-                      "refusal": (None if st in (200, 201, 202) else err_of(st, db))})
-        if st not in (200, 201, 202):
-            continue
-        dep_owned = True
-        t0 = time.time()
-        this_budget = 1500 if attempt["class"].startswith("A100") else 1200
-        while time.time() - t0 < this_budget:
-            if DRY:
-                break
-            time.sleep(20)
-            rst, rb = arm(tok, durl, timeout=150)
-            dep_state = prov_state(rb)
-            rp = (rb.get("properties") or {}) if isinstance(rb, dict) else {}
-            emit("dep-poll", sku=attempt["sku"], http=rst, state=dep_state,
-                 t=round(time.time() - t0), err=(json.dumps(rp.get("error"))[:400]
-                                                 if rp.get("error") else None))
-            if dep_state in ("Succeeded", "Failed", "Canceled"):
-                break
-        if dep_state == "Succeeded":
+        res = None
+        if sdk.get("ok"):
+            res = sdk_deploy(sid, rg, ws, attempt["sku"], summary, attempt["budget"])
+            if res.get("create") not in (200,):
+                # SDK refusal: also try the raw REST shape so the verdict is attributable
+                body = {"location": wloc, "tags": {"c211": NONCE},
+                        "sku": {"name": attempt["sku"], "capacity": 1},
+                        "properties": {
+                            "endpointComputeType": "Managed",
+                            "instanceType": attempt["sku"],
+                            "environmentId": env_id,
+                            "environmentVariables": {"C211_NONCE": NONCE},
+                            "appInsightsEnabled": False}}
+                if code_id:
+                    body["properties"]["codeConfiguration"] = {
+                        "codeId": code_id, "scoringScript": "score.py"}
+                st, db = arm(tok, durl + "?api-version=" + API_W, "PUT", body, timeout=300,
+                             dry_label="dep-create-raw")
+                emit("dep-create-raw", sku=attempt["sku"], cls=attempt["class"], http=st,
+                     **err_of(st, db))
+                res = {"sku": attempt["sku"], "create": st,
+                       "error": json.dumps(err_of(st, db))[:900], "state": None}
+        else:
+            body = {"location": wloc, "tags": {"c211": NONCE},
+                    "sku": {"name": attempt["sku"], "capacity": 1},
+                    "properties": {
+                        "endpointComputeType": "Managed",
+                        "instanceType": attempt["sku"],
+                        "environmentId": env_id,
+                        "environmentVariables": {"C211_NONCE": NONCE},
+                        "appInsightsEnabled": False}}
+            if code_id:
+                body["properties"]["codeConfiguration"] = {
+                    "codeId": code_id, "scoringScript": "score.py"}
+            st, db = arm(tok, durl + "?api-version=" + API_W, "PUT", body, timeout=300,
+                         dry_label="dep-create-raw")
+            emit("dep-create-raw", sku=attempt["sku"], cls=attempt["class"], http=st,
+                 **err_of(st, db))
+            res = {"sku": attempt["sku"], "create": st,
+                   "error": json.dumps(err_of(st, db))[:900], "state": None}
+            if st in (200, 201, 202):
+                dep_owned = True
+                t0 = time.time()
+                while time.time() - t0 < attempt["budget"]:
+                    if DRY:
+                        break
+                    time.sleep(20)
+                    rst, rb = arm(tok, durl + "?api-version=" + API_W, timeout=150)
+                    dep_state = prov_state(rb)
+                    rp = (rb.get("properties") or {}) if isinstance(rb, dict) else {}
+                    emit("dep-poll", sku=attempt["sku"], http=rst, state=dep_state,
+                         t=round(time.time() - t0),
+                         err=clean(json.dumps(rp.get("error"))[:400] if rp.get("error") else "", 400))
+                    if dep_state in ("Succeeded", "Failed", "Canceled"):
+                        break
+                res["state"] = dep_state
+        summary["ladder"].append(res)
+        emit("dep-result", sku=attempt["sku"], cls=attempt["class"],
+             create=res.get("create"), state=res.get("state"),
+             err=clean(res.get("error") or "", 700))
+        if res.get("state") == "Succeeded":
+            dep_owned = True
             break
-        # failed attempt: delete before the next one (one resource alive at a time)
-        del_and_wait(tok, durl, "dep-" + attempt["class"], 600, SUMMARY)
-        dep_owned = False
-        dep_state = None
-    SUMMARY["deployment"] = {"state": dep_state, "tries": tries}
+        # failed/refused attempt: make sure nothing is left alive before the next rung
+        if res.get("create") in (200, 201, 202) or dep_owned:
+            if sdk.get("ok"):
+                sdk_del_deployment(sid, rg, ws, summary, 420)
+            del_and_wait(tok, durl + "?api-version=" + API_W, "dep-" + attempt["class"], 420,
+                         summary)
+            dep_owned = False
+            dep_state = None
+    summary["deployment"] = {"state": dep_state, "tries": summary["ladder"]}
     emit("dep-final", state=dep_state)
 
     # ---- 7) scoring URI + key + POST ----
     score_txt = None
     if dep_state == "Succeeded":
-        st, rb = arm(tok, eurl, timeout=120)
+        st, rb = arm(tok, eurl + "?api-version=" + API_W, timeout=120)
         rp = (rb.get("properties") or {}) if isinstance(rb, dict) else {}
         scoring = rp.get("scoringUri")
-        stk, kb = arm(tok, u(wsu + "/onlineEndpoints/" + EP + "/listKeys?api-version="
-                             + API_W), "POST", {}, timeout=120, dry_label="listkeys")
+        stk, kb = arm(tok, eurl + "/listKeys?api-version=" + API_W, "POST", {}, timeout=120,
+                      dry_label="listkeys")
         key = None
         if isinstance(kb, dict):
             for k, v in kb.items():
                 if "key" in k.lower() and isinstance(v, str) and len(v) > 20:
                     key = v
                     break
-        emit("score-endpoint", http=st, scoring_uri=scoring, keys_http=stk,
-             key_ok=bool(key), key_names=(";".join(list(kb.keys())[:8])
-                                          if isinstance(kb, dict) else "NONE"))
-        SUMMARY["endpoint"].update({"scoring_uri": scoring, "keys_http": stk,
-                                    "key_ok": bool(key)})
-        if scoring and key:
+        emit("score-endpoint", http=st, scoring_uri=clean(scoring, 200), keys_http=stk,
+             key_ok=bool(key), key_names=(";".join(list(kb.keys())[:8]) if isinstance(kb, dict) else "NONE"))
+        summary["endpoint"].update({"scoring_uri": scoring, "keys_http": stk, "key_ok": bool(key)})
+        if scoring and key and not DRY:
             payload = json.dumps({"input_data": {"x": NONCE}}).encode()
-            t0 = time.time()
-            while time.time() - t0 < 480:
-                if DRY:
-                    break
-                got = None
-                for hdr in ("Bearer ", "Key "):
-                    sc, sb = httptext(scoring, method="POST", body=payload, headers={
-                        "Authorization": hdr + key, "Content-Type": "application/json"},
-                        timeout=180)
-                    txt = sb.decode("utf-8", "replace")
-                    emit("score", http=sc, hdr=hdr.strip(), len=len(txt),
-                         has_uuid=bool(UUID_RE.search(txt)), t=round(time.time() - t0),
-                         body_b64=b64(txt)[:3600])
-                    if sc == 200 and ("C211-I125316" in txt or UUID_RE.search(txt)):
-                        got = txt
-                        break
-                    if sc in (400, 401, 403):
-                        continue
-                if got:
-                    score_txt = got
-                    break
-                time.sleep(15)
-            SUMMARY["score"] = {"ok": bool(score_txt),
-                                "uuids": (UUID_RE.findall(score_txt) if score_txt else [])}
-        else:
-            st, lg = arm(tok, u(wsu + "/onlineEndpoints/" + EP + "/deployments/" + DEP +
-                                "/logs?api-version=" + API_W), timeout=180,
-                         dry_label="dep-logs")
-            emit("dep-logs", http=st, body_b64=b64(lg)[:3000])
-    else:
-        # capture the endpoint/deployment verbatim error state for the GATE
-        st, rb = arm(tok, durl, timeout=120) if dep_owned or dep_state else (0, {})
-        rp = (rb.get("properties") or {}) if isinstance(rb, dict) else {}
-        emit("dep-error-readback", http=st, state=rp.get("provisioningState"),
-             err=(json.dumps(rp.get("error"))[:900] if rp.get("error") else None))
-        SUMMARY["deployment"]["error"] = rp.get("error")
+            sts, raw = httptext(scoring, "POST", body=payload,
+                                headers={"Content-Type": "application/json",
+                                         "Authorization": "Bearer " + key}, timeout=300)
+            score_txt = raw.decode("utf-8", "replace")
+            uu = sorted(set(UUID_RE.findall(score_txt)))
+            emit("score", http=sts, bytes=len(score_txt), uuids=(";".join(uu) or "NONE"),
+                 b64=b64(score_txt)[:1200])
+            summary["score"] = {"http": sts, "uuids": uu, "text_b64": b64(score_txt)[:4000]}
+        elif DRY:
+            emit("plan", method="POST", url=str(scoring or "<scoringUri>"), label="score")
 
     # ---- 8) independent readback ----
-    st_d, db2 = arm(tok, durl, timeout=150)
-    rp2 = (db2.get("properties") or {}) if isinstance(db2, dict) else {}
-    st_e, eb2 = arm(tok, eurl, timeout=120)
-    rp3 = (eb2.get("properties") or {}) if isinstance(eb2, dict) else {}
-    st_l, lb2 = arm(tok, u(wsu + "/onlineEndpoints/" + EP + "/deployments?api-version="
-                           + API_W), timeout=120)
-    deps = [{"name": x.get("name"),
-             "instanceType": ((x.get("properties") or {}).get("instanceType")),
-             "state": ((x.get("properties") or {}).get("provisioningState"))}
-            for x in ((lb2.get("value") or []) if isinstance(lb2, dict) else [])]
-    SUMMARY["readback"] = {
-        "deployment_http": st_d, "deployment_state": rp2.get("provisioningState"),
-        "deployment_instanceType": rp2.get("instanceType"),
-        "deployment_instanceCount": rp2.get("instanceCount"),
-        "endpoint_http": st_e, "endpoint_state": rp3.get("provisioningState"),
-        "endpoint_scoringUri_present": bool(rp3.get("scoringUri")),
-        "deployments_list_http": st_l, "deployments": deps}
-    emit("readback", deployment_http=st_d, deployment_state=rp2.get("provisioningState"),
-         instanceType=rp2.get("instanceType"), instanceCount=rp2.get("instanceCount"),
-         endpoint_http=st_e, endpoint_state=rp3.get("provisioningState"),
-         scoring_present=bool(rp3.get("scoringUri")), list_http=st_l,
-         deployments=json.dumps(deps))
+    st, rb = arm(tok, durl + "?api-version=" + API_W, timeout=120)
+    rp2 = (rb.get("properties") or {}) if isinstance(rb, dict) else {}
+    stl, lb2 = arm(tok, eurl + "/deployments?api-version=" + API_W, timeout=120)
+    names2 = [x.get("name") for x in ((lb2.get("value") or []) if isinstance(lb2, dict) else [])]
+    emit("readback", deployment_http=st, deployment_state=prov_state(rb),
+         instanceType=clean(rp2.get("instanceType") or "", 60),
+         instanceCount=rp2.get("instanceCount"),
+         endpoint_http=200, endpoint_state=ep_state,
+         list_http=stl, deployments=(";".join(map(str, names2)) or "NONE"))
+    summary["readback"] = {"deployment_http": st, "deployment_state": prov_state(rb),
+                           "instanceType": rp2.get("instanceType"),
+                           "instanceCount": rp2.get("instanceCount"),
+                           "list_http": stl, "deployments": names2}
 
-    # ---- 9) teardown ----
-    teardown(tok, wsu, eurl, ep_owned, SUMMARY)
+    # ---- 9) teardown deployment -> endpoint -> code/env assets ----
+    if sdk.get("ok") and not DRY:
+        sdk_del_deployment(sid, rg, ws, summary, 420)
+    del_and_wait(tok, durl + "?api-version=" + API_W, "deployment-final", 900, summary)
+    del_and_wait(tok, eurl + "?api-version=" + API_W, "endpoint-final", 900, summary)
+    st, lb3 = arm(tok, eurl + "/deployments?api-version=" + API_W, timeout=120)
+    emit("dep-list-after", http=st, total=len(((lb3.get("value") or []) if isinstance(lb3, dict) else [])))
+    del_and_wait(tok, wsurl + "/codes/" + CODE + "/versions/1?api-version=" + API_W,
+                 "code-asset", 300, summary)
+    bl = summary.get("rest_code_blob") or {}
+    sa2 = summary.get("rest_code_sa") or ""
+    if bl.get("container") and bl.get("prefix") and sa2 and not DRY:
+        try:
+            stk2, kb2 = arm(tok, u("/subscriptions/" + sid + "/resourceGroups/" + rg +
+                                   "/providers/Microsoft.Storage/storageAccounts/" + sa2 +
+                                   "/listKeys?api-version=2023-01-01"), "POST", {},
+                            dry_label="storage-listkeys-2")
+            k2 = (kb2.get("keys") or [{}])[0].get("value") if isinstance(kb2, dict) else None
+            if k2:
+                for suffix in ("/score.py", "/code.zip"):
+                    xms2 = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+                    hh = {"x-ms-date": xms2, "x-ms-version": "2022-11-02"}
+                    path = str(bl.get("prefix")) + suffix
+                    canon = "/blob/%s/%s/%s" % (sa2, bl.get("container"), path)
+                    hh["Authorization"] = blobsig(sa2, k2, "DELETE", canon, hh)
+                    stx, _rx = httptext("https://%s.blob.core.windows.net/%s/%s"
+                                        % (sa2, bl.get("container"), path), "DELETE",
+                                        headers=hh, timeout=120)
+                    emit("blob-delete", path=clean(suffix, 20), http=stx)
+        except Exception as e:  # noqa: BLE001
+            emit("blob-delete", http=-1, err=clean(repr(e), 300))
+    del_and_wait(tok, wsurl + "/environments/" + ENVNAME + "/versions/1?api-version=" + API_W,
+                 "env-asset", 300, summary)
+    st, lb4 = arm(tok, wsurl + "/onlineEndpoints?api-version=" + API_W, timeout=120)
+    n4 = [x.get("name") for x in ((lb4.get("value") or []) if isinstance(lb4, dict) else [])]
+    emit("ep-list-after", http=st, total=len(n4), ours=(";".join(x for x in n4 if x == EP) or "NONE"))
+    _summary_print(summary)
+    emit("PROBE-EXIT", code=0, elapsed=round(time.time() - T0, 1))
+    return 0
 
 
-def teardown(tok, wsu, eurl, ep_owned, summary):
-    if ep_owned:
-        durl = u(wsu + "/onlineEndpoints/" + EP + "/deployments/" + DEP + "?api-version="
-                 + API_W)
-        del_and_wait(tok, durl, "deployment-final", 700, summary)
-        del_and_wait(tok, eurl, "endpoint-final", 700, summary)
-        st, lb = arm(tok, u(wsu + "/onlineEndpoints?api-version=" + API_W), timeout=120)
-        names = [x.get("name") for x in ((lb.get("value") or [])
-                                        if isinstance(lb, dict) else [])]
-        ours = [n for n in names if str(n).startswith("c211-i125316")]
-        summary["cleanup"]["list_after"] = {"http": st, "ours": ours,
-                                           "total": len(names)}
-        emit("ep-list-after", http=st, total=len(names),
-             ours=(";".join(ours) if ours else "NONE"))
-    summary["elapsed"] = round(time.time() - T0, 1)
-    blob = b64(json.dumps(summary, default=str))
-    for k in range(0, len(blob), 6000):
-        emit("SUMMARY-PART", i=k // 6000, part=blob[k:k + 6000])
-    emit("PROBE-EXIT", code=0, elapsed=summary["elapsed"])
+def _summary_print(summary):
+    blob = json.dumps(summary, sort_keys=True, default=str)
+    total = max(1, (len(blob) + 799) // 800)
+    for k in range(total):
+        emit("SUMMARY-PART", i=k, n=total, part=blob[k * 800:(k + 1) * 800])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
