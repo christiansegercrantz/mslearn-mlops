@@ -70,6 +70,21 @@ def main():
     if RG:
         stv, vn = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks?api-version=2024-01-01')
         R['vnets_before'] = {'status': stv, 'names': [v.get('name') for v in (vn.get('value') or [])] if stv == 200 else vn}
+    # ---- pre-clean any leftover c211-i120316-* vnet from an earlier attempt ----
+    R['preclean'] = []
+    if RG:
+        stv0, vn0 = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks?api-version=2024-01-01')
+        left = [v.get('name') for v in (vn0.get('value') or []) if str(v.get('name','')).startswith('c211-i120316-')] if stv0 == 200 else []
+        for nmv in left:
+            ds, _, _ = jcall(tok, 'DELETE', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{nmv}?api-version=2024-01-01')
+            last = None
+            for i in range(60):
+                time.sleep(6)
+                last, _ = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{nmv}?api-version=2024-01-01')
+                if last == 404: break
+            R['preclean'].append({'vnet': nmv, 'delete': ds, 'absence': last})
+        stv1, vn1 = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks?api-version=2024-01-01')
+        R['vnets_after_preclean'] = {'status': stv1, 'names': [v.get('name') for v in (vn1.get('value') or [])] if stv1 == 200 else vn1}
     # ---- SKU catalog: ONE call, client-side location filter ----
     sts, cat = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/skus?api-version=2021-07-01')
     R['sku_catalog_status'] = sts
@@ -83,8 +98,13 @@ def main():
         caps = {c.get('name'): c.get('value') for c in (s.get('capabilities') or [])}
         try: vc = int(caps.get('vCPUs') or 999)
         except Exception: vc = 999
+        zrestr = [r for r in (s.get('restrictions') or []) if r.get('type') == 'Zone']
+        zones = []
+        for r in zrestr:
+            for z in ((r.get('restrictionInfo') or {}).get('zones') or []):
+                if z not in zones: zones.append(z)
         skus.append({'sku': nm, 'family': s.get('family'), 'vcpus': vc, 'gpus': caps.get('GPUs'),
-                     'gpu_name': caps.get('GPU'), 'locs': s.get('locations') or []})
+                     'gpu_name': caps.get('GPU'), 'locs': s.get('locations') or [], 'zones': zones})
     R['gpu_skus_offered'] = len(skus)
     # ---- quota for the candidate regions only ----
     pref_regions = ['westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus', 'eastus2']
@@ -130,10 +150,10 @@ def main():
     for score, region, sinfo, avail in cands[:3]:
         sku = sinfo['sku']
         pre = 'c211-i120316-' + nonce
-        vnet = pre + '-vnet'; sn = pre + '-subnet'; nic = pre + '-nic'; vm = pre + '-vm'
-        att = {'region': region, 'sku': sku, 'avail': avail, 'steps': {}}
+        vnet = pre + '-' + region + '-vnet'; sn = pre + '-' + region + '-subnet'; nic = pre + '-' + region + '-nic'; vm = pre + '-' + region + '-vm'
+        att = {'region': region, 'sku': sku, 'avail': avail, 'sku_zones': sinfo.get('zones'), 'steps': {}}
         attempts.append(att)
-        marker.update({'attempted': True, 'region': region, 'sku': sku, 'rg': RG, 'names': {'vnet': vnet, 'subnet': sn, 'nic': nic, 'vm': vm}})
+        marker.update({'attempted': True, 'region': region, 'sku': sku, 'rg': RG, 'names': {'vnet': vnet, 'subnet': sn, 'nic': nic, 'vm': vm, 'region': region}})
         vb = {'location': region, 'tags': {'c211': 'i120316', 'nonce': nonce},
               'properties': {'addressSpace': {'addressPrefixes': ['10.211.0.0/16']},
                              'subnets': [{'name': sn, 'properties': {'addressPrefix': '10.211.1.0/24'}}]}}
@@ -141,7 +161,7 @@ def main():
         att['steps']['vnet_create'] = {'status': s1, 'resp': (r1 if s1 not in (200, 201) else {'id': r1.get('id')}), 'err': (r1.get('error') or {}).get('code') if isinstance(r1, dict) else None}
         if s1 not in (200, 201):
             continue
-        subnet_id = f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{sn}'
+        subnet_id = f'/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{sn}'
         nb = {'location': region, 'tags': {'c211': 'i120316', 'nonce': nonce},
               'properties': {'ipConfigurations': [{'name': 'ipcfg', 'properties': {'privateIPAllocationMethod': 'Dynamic', 'subnet': {'id': subnet_id}}}]}}
         s2, r2, _ = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/networkInterfaces/{nic}?api-version=2024-01-01', nb)
@@ -157,6 +177,8 @@ def main():
                 'osProfile': {'computerName': ('c211' + nonce)[:15], 'adminUsername': 'c211probe', 'adminPassword': pw,
                               'linuxConfiguration': {'disablePasswordAuthentication': False}},
                 'networkProfile': {'networkInterfaces': [{'id': r2.get('id'), 'properties': {'deleteOption': 'Delete'}}]}}}
+        if sinfo.get('zones'):
+            vmb['zones'] = [sinfo['zones'][0]]
         s3, r3, _ = jcall(tok, 'PUT', f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{vm}?api-version=2024-07-01', vmb, timeout=180)
         att['steps']['vm_create'] = {'status': s3, 'resp': (r3 if s3 not in (200, 201) else {'id': r3.get('id'), 'name': r3.get('name')}),
                                      'err': (r3.get('error') or {}) if isinstance(r3, dict) else None}
@@ -238,8 +260,8 @@ def cleanup(tok, sub, RG, vnet, nic, vm, R, marker=None):
             time.sleep(8)
         C['vnet_delete_status'] = sd
         last = None
-        for i in range(30):
-            time.sleep(5)
+        for i in range(60):
+            time.sleep(6)
             last, _ = jget(tok, f'{ARM}/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/{vnet}?api-version=2024-01-01')
             if last == 404: break
         C['vnet_absence_status'] = last
@@ -253,7 +275,7 @@ def cleanup(tok, sub, RG, vnet, nic, vm, R, marker=None):
 def emit(R):
     blob = json.dumps(R)
     b64 = base64.b64encode(blob.encode()).decode()
-    summ = {'sub': R.get('sub'), 'rg': R.get('rg'), 'vnets_before': R.get('vnets_before'),
+    summ = {'sub': R.get('sub'), 'rg': R.get('rg'), 'vnets_before': R.get('vnets_before'), 'preclean': R.get('preclean'), 'vnets_after_preclean': R.get('vnets_after_preclean'),
             'sku_catalog_count': R.get('sku_catalog_count'), 'gpu_skus_offered': R.get('gpu_skus_offered'),
             'sel_candidates': R.get('sel_candidates'), 'attempts': [{k: v for k, v in a.items() if k != 'steps'} | {'step_statuses': {kk: vv.get('status') for kk, vv in (a.get('steps') or {}).items()}} for a in (R.get('attempts') or [])],
             'marker': {k: R.get('marker', {}).get(k) for k in ('attempted', 'nonce', 'region', 'sku', 'provision_state', 'provisioned', 'runcommand_status', 'device_signals', 'list_with_marker', 'tag_readback', 'cleanup')},
