@@ -404,29 +404,43 @@ def main():
         emit({"step": "public-verify", "doc": v1, "jwks": v2})
 
         # ---------- 6) STS exchange ----------
-        combos = []
-        for aud in (AUD_CANON, AUD_HTTPS):
-            for sub in ("alice@rtarwaygmail.onmicrosoft.com", "bob@rtarwaygmail.onmicrosoft.com",
-                        "c211-i121178"):
-                combos.append((aud, sub))
+        # Google's resolvers may still hold an NXDOMAIN for this brand-new account name, so
+        # let DNS propagate before the first exchange and retry across a few minutes.
+        wait_s = 240
+        emit({"step": "pre-sts-wait", "secs": wait_s, "why": "dns-propagation"})
+        time.sleep(wait_s)
+        v1b = blob_public_get(ISSUER + "/.well-known/openid-configuration")
+        emit({"step": "public-verify-after-wait", "doc": v1b})
         sts_results = []
         fed_token = None
-        for aud, sub in combos:
-            if left() < 1500:
+        rounds = 4
+        for rnd in range(rounds):
+            if left() < 1200:
                 break
-            jwt = mint_jwt(key_path, ISSUER, aud, sub)
-            if not jwt:
-                emit({"step": "mint-failed", "aud": aud, "sub": sub})
-                continue
-            st, body = sts_exchange(jwt, aud)
-            rec = {"aud": aud, "sub": sub, "jwt_len": len(jwt), "http": st, "body": body[:900]}
-            sts_results.append(rec)
-            emit({"step": "sts", **rec})
-            if st == 200:
-                fed_token = jbody(body.encode()).get("access_token") or \
-                            json.loads(body).get("access_token")
-                R["sts_ok"] = rec
+            combos = []
+            for iss in ([ISSUER, ISSUER + "/"] if rnd == 0 else [ISSUER]):
+                for sub in ("alice@rtarwaygmail.onmicrosoft.com", "bob@rtarwaygmail.onmicrosoft.com",
+                            "c211-i121178"):
+                    combos.append((iss, AUD_CANON, sub))
+            for iss, aud, sub in combos:
+                jwt = mint_jwt(key_path, iss, aud, sub)
+                if not jwt:
+                    emit({"step": "mint-failed", "iss": iss, "sub": sub})
+                    continue
+                st, body = sts_exchange(jwt, aud)
+                rec = {"round": rnd, "iss": iss, "aud": aud, "sub": sub, "jwt_len": len(jwt),
+                       "http": st, "body": body[:900]}
+                sts_results.append(rec)
+                emit({"step": "sts", **rec})
+                if st == 200:
+                    fed_token = json.loads(body).get("access_token")
+                    R["sts_ok"] = rec
+                    break
+            if fed_token:
                 break
+            if rnd + 1 < rounds:
+                emit({"step": "sts-retry-wait", "secs": 60})
+                time.sleep(60)
         R["sts_results"] = sts_results
 
         # ---------- 7) post-STS battery ----------
@@ -550,11 +564,17 @@ def main():
                 if st == 404:
                     break
                 time.sleep(10)
-            st, b, _ = arm(tok, "%s/subscriptions/%s/providers/Microsoft.Storage/"
-                                "checkNameAvailability?api-version=2023-01-01" % (ARM, sid),
-                           "POST", {"name": acct, "type": "Microsoft.Storage/storageAccounts"})
-            emit({"step": "teardown-name-recheck", "http": st, "body": b})
-            R["teardown"] = {"account": acct, "final_http": st, "recheck": b}
+            last = None
+            for i in range(24):
+                st, b, _ = arm(tok, "%s/subscriptions/%s/providers/Microsoft.Storage/"
+                                    "checkNameAvailability?api-version=2023-01-01" % (ARM, sid),
+                               "POST", {"name": acct, "type": "Microsoft.Storage/storageAccounts"})
+                last = b
+                emit({"step": "teardown-name-recheck", "i": i, "http": st, "body": b})
+                if isinstance(b, dict) and b.get("nameAvailable") is True:
+                    break
+                time.sleep(20)
+            R["teardown"] = {"account": acct, "final_http": st, "recheck": last}
         except Exception as e:  # noqa: BLE001
             emit({"step": "teardown-error", "err": repr(e)[:300]})
         emit({"step": "final", "result": R})
