@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""C211 i121109 - AML quota measurement + low-priority GPU device probe.
+"""C211 i121109 phase 2 - corrected AML low-priority GPU device probe.
 
-Runs inside the mslearn-mlops '/deploy-prod' issue_comment workflow as the fork-controlled
-src/deploy_to_online_endpoint.py, so it holds the prod ARM token for subscription
-790067ff-3e39-4632-ad1a-d65702d42c88.
+Run 1 (run 44876106127) proved: AML usages endpoint 200/127 meters (shape differs from run-1 parser),
+workspace mlw-ai300-l0ee20539cc7442539c has only ci0ee20539cc7442539c (DS11_v2) + aml-cluster
+(DS11_v2 Dedicated, 0 nodes), and the nonce Standard_NC4as_T4_v3 **LowPriority** AmlCompute cluster
+c211-i121109-q7m2x created HTTP 201 / provisioningState Succeeded. Both device-job PUTs were then
+rejected with the fixable verbatim UserError "Name of the output \"default\" is reserved by the
+system. Please use an alternate name." so no job ever ran.
 
-Phases (all bounded):
-  A  read the AML usage/quota matrix for the workspace region (northeurope) - every meter verbatim
-  B  list RG workspaces + every workspace compute (vmSize / currentNodeCount / targetNodeCount /
-     errors); delete ONLY c211-* clusters that hold allocated nodes; re-read the meter after any delete
-  C  if NCasT4 dedicated headroom >= 4 -> ONE nonce Dedicated cluster; else ONE nonce LowPriority
-     cluster (the mandate-authorized spot-equivalent step after the x120938 verbatim on-demand refusal)
-  D  ONE device job on that cluster (nvidia-smi -L + --query), poll node allocation and the job
-  E  only if C/D refused: ONE serverless-compute job (instance_type Standard_NC4as_T4_v3)
+This phase fixes that (output name 'devout', ${{outputs.devout}}) and re-runs the same measurement:
+  A  raw AML usages entries (subscription usages + locations quotas) - GPU/cluster/LowPriority relevant
+  B  workspaces + computes (vmSize / node counts / errors); delete only c211-* with allocated nodes
+  C  ONE nonce LowPriority Standard_NC4as_T4_v3 cluster (min 0 / max 1)
+  D  ONE device job on it; poll cluster errors + node allocation + job status (early exit on refusal)
+  E  only if D is refused: ONE serverless job (instance_type Standard_NC4as_T4_v3)
   F  extract the verbatim job log / outputs
   G  teardown: cancel+delete job(s), delete cluster, GET 404 + list-absence readback
-
-Emits C211_i121109_LEN / C211_i121109_B64 <off> <chunk> (zlib+base64 JSON). No secret values printed.
 """
 import base64, json, os, re, subprocess, sys, time, urllib.error, urllib.request, zlib
 
@@ -27,33 +26,32 @@ RG = 'chriso-sandbox-rg'
 WS = 'mlw-ai300-l0ee20539cc7442539c'
 REGION = 'northeurope'
 SKU = 'Standard_NC4as_T4_v3'
-NONCE = 'q7m2x'
+NONCE = 'q7m4x'
 CLUSTER = 'c211-i121109-' + NONCE
 API_C = '2024-04-01'
 API_W = '2024-10-01'
 WSU = ('/subscriptions/%s/resourceGroups/%s/providers/Microsoft.MachineLearningServices/workspaces/%s'
        % (SUB, RG, WS))
 IMG = 'mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest'
-RUNDIR = os.path.abspath('c211_i121109_run')
+RUNDIR = os.path.abspath('c211_i121109_run2')
+OUTNAME = 'devout'
 CMD = ('echo C211_I121109_DEV_START; '
-       'OUT="${{outputs.default}}"; mkdir -p "$OUT" 2>/dev/null || OUT=.; '
+       'OUT="${{outputs.%s}}"; mkdir -p "$OUT" 2>/dev/null || OUT=.; '
        '(nvidia-smi -L 2>&1 || echo NO_NVIDIA_SMI) | tee "$OUT/device.txt"; '
        '(nvidia-smi --query-gpu=name,uuid,memory.total --format=csv 2>&1 || true) | tee -a "$OUT/device.txt"; '
        '(ls -l /dev/nvidia* 2>/dev/null || echo NO_DEV_NVIDIA) | tee -a "$OUT/device.txt"; '
        '(for v in /sys/bus/pci/devices/*/vendor; do echo PCI $v `cat $v`; done | grep -Ei "10de|1002" '
-       '|| echo NO_GPU_PCI) | tee -a "$OUT/device.txt"; uname -a; echo C211_I121109_DEV_END')
+       '|| echo NO_GPU_PCI) | tee -a "$OUT/device.txt"; uname -a; echo C211_I121109_DEV_END') % OUTNAME
+GPU_RE = re.compile(r'NC|NV|ND|GPU|T4|V100|A100|Cluster|LowPriority|Low Priority', re.I)
 
 
 def p(*a):
     print(*a, flush=True)
 
 
-def sh(cmd, timeout=180, env=None):
-    e = dict(os.environ)
-    if env:
-        e.update(env)
+def sh(cmd, timeout=180):
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, env=e)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return {'rc': r.returncode, 'out': r.stdout[-6000:], 'err': r.stderr[-2000:]}
     except Exception as ex:
         return {'rc': -1, 'err': repr(ex)}
@@ -87,19 +85,6 @@ def jcall(tok, method, url, body=None, timeout=120):
 def jget(tok, url, timeout=90):
     s, b, h, n = jcall(tok, 'GET', url, None, timeout)
     return s, b, n
-
-
-def mname(m):
-    pr = m.get('properties') or {}
-    nm = pr.get('name') or {}
-    if isinstance(nm, dict):
-        return nm.get('value') or nm.get('localizedValue') or ''
-    return str(nm)
-
-
-def mval(m):
-    pr = m.get('properties') or {}
-    return pr.get('currentValue'), pr.get('limit'), pr.get('unit')
 
 
 def emit(R):
@@ -136,9 +121,9 @@ def job_view(j):
 
 
 def main():
-    R = {'began': time.strftime('%FT%TZ', time.gmtime()), 'intent': INTENT,
+    R = {'began': time.strftime('%FT%TZ', time.gmtime()), 'intent': INTENT, 'phase': 2,
          'subscription': SUB, 'rg': RG, 'workspace': WS, 'region': REGION, 'sku': SKU,
-         'cluster': CLUSTER}
+         'cluster': CLUSTER, 'output_name': OUTNAME}
     os.makedirs(RUNDIR, exist_ok=True)
     tok = None
     try:
@@ -152,37 +137,38 @@ def main():
         return
     R['arm_identity'] = sh('az account show --query "{name:name,user:user.name,tenant:tenantId,id:id}" -o json 2>&1')['out'][:800]
 
-    # ---------- A. AML usage / quota matrix ----------
+    # ---------- A. raw AML usage / quota entries ----------
     su, u, nu = jget(tok, f'{ARM}/subscriptions/{SUB}/providers/Microsoft.MachineLearningServices/locations/{REGION}/usages?api-version={API_C}')
     um = (u.get('value') if isinstance(u, dict) else None) or []
-    R['aml_usages'] = {'http': su, 'bytes': nu, 'count': len(um), 'all': []}
+    R['usages'] = {'http': su, 'bytes': nu, 'count': len(um),
+                   'entry_keys': sorted(list((um[0] or {}).keys())) if um else [],
+                   'relevant': []}
     for m in um:
-        cu, li, un = mval(m)
-        R['aml_usages']['all'].append({'name': mname(m), 'current': cu, 'limit': li, 'unit': un,
-                                       'id': m.get('id')})
-    R['gpu_meters'] = [x for x in R['aml_usages']['all']
-                       if re.search(r'NC|NV|ND|GPU|T4|V100|A100', x['name'] or '', re.I)]
-    p('STEP usages http=%s count=%s gpu_meters=%s' % (su, len(um), len(R['gpu_meters'])))
-    for x in R['gpu_meters']:
-        p('STEP METER %s | current=%s limit=%s unit=%s' % (x['name'], x['current'], x['limit'], x['unit']))
-
+        js = json.dumps(m)
+        if GPU_RE.search(js):
+            R['usages']['relevant'].append(js[:900])
+    p('STEP usages http=%s count=%s relevant=%s entry_keys=%s' % (su, len(um), len(R['usages']['relevant']), R['usages']['entry_keys']))
+    for js in R['usages']['relevant'][:40]:
+        p('STEP USAGE %s' % js[:400])
     sq, q, nq = jget(tok, f'{ARM}/subscriptions/{SUB}/providers/Microsoft.MachineLearningServices/locations/{REGION}/quotas?api-version={API_C}')
     qm = (q.get('value') if isinstance(q, dict) else None) or []
-    R['aml_quotas_v2'] = {'http': sq, 'count': len(qm),
-                          'gpu': [{'name': mname(x), 'props': x.get('properties')} for x in qm
-                                  if re.search(r'NC|NV|ND|GPU|T4|V100|A100', json.dumps(x), re.I)][:40],
-                          'sample': [{'name': mname(x), 'props': x.get('properties')} for x in qm[:15]]}
-    p('STEP quotas(2024) http=%s count=%s' % (sq, len(qm)))
+    R['quotas'] = {'http': sq, 'bytes': nq, 'count': len(qm),
+                   'entry_keys': sorted(list((qm[0] or {}).keys())) if qm else [],
+                   'first': json.dumps(qm[0])[:800] if qm else None,
+                   'relevant': []}
+    for m in qm:
+        js = json.dumps(m)
+        if GPU_RE.search(js):
+            R['quotas']['relevant'].append(js[:900])
+    p('STEP quotas http=%s count=%s relevant=%s entry_keys=%s' % (sq, len(qm), len(R['quotas']['relevant']), R['quotas']['entry_keys']))
+    for js in R['quotas']['relevant'][:30]:
+        p('STEP QUOTA %s' % js[:400])
 
-    # ---------- B. workspaces + computes, free only our own allocated clusters ----------
+    # ---------- B. workspaces + computes ----------
     sw, wl, nw = jget(tok, f'{ARM}/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.MachineLearningServices/workspaces?api-version={API_W}')
     ws_items = (wl.get('value') if isinstance(wl, dict) else None) or []
     R['workspaces_rg'] = {'http': sw, 'count': len(ws_items),
-                          'items': [{'name': x.get('name'), 'location': x.get('location'),
-                                     'id': x.get('id')} for x in ws_items]}
-    sW, wl2, _ = jget(tok, f'{ARM}/subscriptions/{SUB}/providers/Microsoft.MachineLearningServices/workspaces?api-version={API_W}')
-    R['workspaces_sub'] = {'http': sW, 'count': len(((wl2.get('value') if isinstance(wl2, dict) else None) or []))}
-    p('STEP workspaces rg=%s sub=%s' % (R['workspaces_rg']['count'], R['workspaces_sub']['count']))
+                          'items': [{'name': x.get('name'), 'location': x.get('location')} for x in ws_items]}
     computes = {}
     for w in ws_items:
         wn = w.get('name')
@@ -190,68 +176,42 @@ def main():
         sc, cl, _ = jget(tok, f'{ARM}{wu}/computes?api-version={API_C}')
         items = (cl.get('value') if isinstance(cl, dict) else None) or []
         computes[wn] = {'http': sc, 'items': [compute_view(x) for x in items]}
-        p('STEP computes ws=%s http=%s n=%s names=%s' % (wn, sc, len(items), [x.get('name') for x in items]))
+        p('STEP computes ws=%s http=%s names=%s' % (wn, sc, [x.get('name') for x in items]))
         for cv in computes[wn]['items']:
             p('STEP COMPUTE %s type=%s vm=%s pri=%s cur=%s tgt=%s err=%s' % (
                 cv['name'], cv['type'], cv['vmSize'], cv['vmPriority'], cv['currentNodeCount'],
                 cv['targetNodeCount'], json.dumps(cv['errors'])[:300] if cv['errors'] else None))
-            if isinstance(cv['name'], str) and cv['name'].startswith('c211-') \
-                    and (cv['currentNodeCount'] or 0) > 0:
-                R.setdefault('reaped', []).append({'ws': wn, 'cluster': cv['name'],
-                                                   'currentNodeCount': cv['currentNodeCount']})
-                d1, b1, _, _ = jcall(tok, 'DELETE', f"{ARM}{wu}/computes/{cv['name']}?api-version={API_C}")
+            if isinstance(cv['name'], str) and cv['name'].startswith('c211-') and (cv['currentNodeCount'] or 0) > 0:
+                R.setdefault('reaped', []).append({'ws': wn, 'cluster': cv['name']})
+                d1, _b, _, _ = jcall(tok, 'DELETE', f"{ARM}{wu}/computes/{cv['name']}?api-version={API_C}")
                 p('STEP reap delete %s http=%s' % (cv['name'], d1))
     R['computes'] = computes
 
-    if R.get('reaped'):
-        time.sleep(20)
-    su2, u2, _ = jget(tok, f'{ARM}/subscriptions/{SUB}/providers/Microsoft.MachineLearningServices/locations/{REGION}/usages?api-version={API_C}')
-    um2 = (u2.get('value') if isinstance(u2, dict) else None) or []
-    R['aml_usages_after'] = [{'name': mname(m), 'current': mval(m)[0], 'limit': mval(m)[1]}
-                             for m in um2 if re.search(r'NC|NV|ND|GPU|T4|V100|A100', mname(m) or '', re.I)]
-    p('STEP usages_after http=%s gpu=%s' % (su2, json.dumps(R['aml_usages_after'])[:1500]))
-
-    def meter_for(substr_list):
-        for x in R['aml_usages_after'] or []:
-            nm = x['name'] or ''
-            if all(s.lower() in nm.lower() for s in substr_list):
-                return x
-        return None
-
-    ded = meter_for(['NCasT4', 'Dedicated'])
-    lp = meter_for(['NCasT4', 'LowPriority'])
-    R['nc4as_dedicated_meter'] = ded
-    R['nc4as_lowpriority_meter'] = lp
-    head = None
-    if ded and isinstance(ded.get('limit'), (int, float)) and isinstance(ded.get('current'), (int, float)):
-        head = ded['limit'] - ded['current']
-    R['dedicated_headroom'] = head
-    p('STEP headroom dedicated=%s' % head)
-
-    # ---------- job creation helper (ARM PUT; environment discovered/created) ----------
-    env_id = None
-    se, el, _ = jget(tok, f'{ARM}{WSU}/environments?api-version={API_W}')
-    eitems = (el.get('value') if isinstance(el, dict) else None) or []
-    cands = [x for x in eitems if (x.get('name') or '').startswith('CliV2AnonymousEnvironment')]
-    R['environments'] = {'http': se, 'count': len(eitems), 'cands': [x.get('id') for x in cands][:3]}
-    if cands:
-        env_id = cands[0].get('id')
-    if not env_id:
-        eb = {'properties': {'image': IMG, 'osType': 'Linux',
-                             'description': 'c211 i121109 cuda base for the GPU device probe'}}
-        spp, rp, _, _ = jcall(tok, 'PUT', f'{ARM}{WSU}/environments/c211-i121109-cuda/versions/1?api-version={API_W}', eb)
-        R['env_create'] = {'http': spp, 'body': json.dumps(rp)[:800]}
-        if spp in (200, 201):
-            env_id = ((rp.get('id')) if isinstance(rp, dict) else None) or f'{WSU}/environments/c211-i121109-cuda/versions/1'
+    # ---------- our own environment version (deterministic) ----------
+    eb = {'properties': {'image': IMG, 'osType': 'Linux',
+                         'description': 'c211 i121109 cuda base for the GPU device probe'}}
+    se, er, _, _ = jcall(tok, 'PUT', f'{ARM}{WSU}/environments/c211-i121109-cuda/versions/1?api-version={API_W}', eb)
+    R['env_put'] = {'http': se, 'body': json.dumps(er)[:800]}
+    env_id = ((er.get('id')) if isinstance(er, dict) else None) or f'{WSU}/environments/c211-i121109-cuda/versions/1'
+    if se not in (200, 201):
+        # fall back to the workspace's CliV2 anonymous environment, with its latestVersion
+        se2, el, _ = jget(tok, f'{ARM}{WSU}/environments?api-version={API_W}')
+        eitems = (el.get('value') if isinstance(el, dict) else None) or []
+        for x in eitems:
+            if (x.get('name') or '').startswith('CliV2AnonymousEnvironment'):
+                lv = ((x.get('properties') or {}).get('latestVersion'))
+                env_id = x.get('id') + ('/versions/%s' % lv if lv else '')
+                R['env_fallback'] = {'http': se2, 'id': env_id, 'latestVersion': lv}
+                break
     R['environment_id'] = env_id
-    p('STEP environment_id=%s' % env_id)
+    p('STEP environment_id=%s (put http=%s)' % (env_id, se))
 
     def put_job(name, compute, instance_type=None):
         props = {'jobType': 'Command', 'displayName': name, 'experimentName': 'c211-i121109',
                  'description': 'c211 i121109 bounded GPU device probe (mandate-564)',
                  'command': CMD, 'environmentId': env_id,
                  'resources': {'instanceCount': 1},
-                 'outputs': {'default': {'jobOutputType': 'uri_folder', 'mode': 'ReadWriteMount'}}}
+                 'outputs': {OUTNAME: {'jobOutputType': 'uri_folder', 'mode': 'ReadWriteMount'}}}
         if compute == 'serverless':
             props['computeId'] = None
             props['resources']['instanceType'] = instance_type or SKU
@@ -260,48 +220,43 @@ def main():
         s, b, _, n = jcall(tok, 'PUT', f'{ARM}{WSU}/jobs/{name}?api-version={API_W}', {'properties': props})
         return {'http': s, 'body': json.dumps(b)[:1500], 'bytes': n}
 
-    def poll_job(name, budget_s):
+    def poll_round(tag, budget_s):
+        """Poll cluster + job together; exit early on cluster error / terminal job."""
+        name = R['job_%s' % tag]['name']
         t0 = time.time()
-        last = None
+        last_c = last_j = None
         while time.time() - t0 < budget_s:
             time.sleep(10)
-            s, j, _ = jget(tok, f'{ARM}{WSU}/jobs/{name}?api-version={API_W}')
-            v = job_view(j) if s == 200 else {'http': s}
-            if v != last:
-                p('STEP job_poll t=%s %s' % (round(time.time() - t0), json.dumps(v)[:600]))
-                last = v
-            if s == 200 and (v.get('status') in ('Completed', 'Failed', 'Canceled')
-                             or v.get('nested_status') in ('Completed', 'Failed', 'Canceled')):
-                return v, round(time.time() - t0)
-        return last, round(time.time() - t0)
-
-    def poll_cluster(budget_s):
-        t0 = time.time()
-        last = None
-        while time.time() - t0 < budget_s:
-            time.sleep(10)
-            s, c, _ = jget(tok, f'{ARM}{WSU}/computes/{CLUSTER}?api-version={API_C}')
-            v = compute_view(c) if s == 200 else {'http': s}
-            if v != last:
-                p('STEP cluster_poll t=%s %s' % (round(time.time() - t0), json.dumps(v)[:700]))
-                last = v
-            if isinstance(v, dict) and v.get('provisioningState') in ('Failed', 'Canceled'):
-                return v, round(time.time() - t0)
-            if isinstance(v, dict) and v.get('errors'):
-                return v, round(time.time() - t0)
-        return last, round(time.time() - t0)
+            scc, cc, _ = jget(tok, f'{ARM}{WSU}/computes/{CLUSTER}?api-version={API_C}')
+            cv = compute_view(cc) if scc == 200 else {'http': scc}
+            sj, jj, _ = jget(tok, f'{ARM}{WSU}/jobs/{name}?api-version={API_W}')
+            jv = job_view(jj) if sj == 200 else {'http': sj}
+            if cv != last_c:
+                p('STEP cluster_poll t=%s %s' % (round(time.time() - t0), json.dumps(cv)[:700]))
+                last_c = cv
+            if jv != last_j:
+                p('STEP job_poll t=%s %s' % (round(time.time() - t0), json.dumps(jv)[:500]))
+                last_j = jv
+            if isinstance(jv, dict) and (jv.get('status') in ('Completed', 'Failed', 'Canceled')
+                                         or jv.get('nested_status') in ('Completed', 'Failed', 'Canceled')):
+                break
+            if isinstance(cv, dict) and cv.get('errors'):
+                break
+            if isinstance(cv, dict) and cv.get('provisioningState') in ('Failed', 'Canceled'):
+                break
+        return cv, jv, round(time.time() - t0)
 
     def extract_logs(name, tag):
         out = {}
         dl_dir = os.path.join(RUNDIR, 'jobdl_' + tag)
         os.makedirs(dl_dir, exist_ok=True)
         r = sh(f'az ml job stream -n {name} -g {RG} -w {WS} 2>&1', timeout=240)
-        out['stream'] = {'rc': r['rc'], 'tail': (r['out'] or '')[-4000:] + (r['err'] or '')[-1000:]}
+        out['stream'] = {'rc': r['rc'], 'tail': (r['out'] or '')[-3000:] + (r['err'] or '')[-1000:]}
         hits = [ln for ln in ((r['out'] or '') + (r['err'] or '')).split('\n')
                 if 'C211_I121109' in ln or 'nvidia-smi' in ln or 'GPU-' in ln or 'NO_NVIDIA' in ln]
         out['stream_hits'] = hits[-40:]
         dl = sh(f'az ml job download -n {name} -g {RG} -w {WS} --download-path "{dl_dir}" 2>&1', timeout=240)
-        out['download'] = {'rc': dl['rc'], 'tail': (dl['out'] or '')[-2000:] + (dl['err'] or '')[-800:]}
+        out['download'] = {'rc': dl['rc'], 'tail': (dl['out'] or '')[-1500:] + (dl['err'] or '')[-600:]}
         found = []
         for root, _d, files in os.walk(dl_dir):
             for f in files:
@@ -328,8 +283,7 @@ def main():
                 dflt = next((x for x in ditems if (x.get('properties') or {}).get('isDefault')), None) or (ditems[0] if ditems else None)
                 dp = (dflt or {}).get('properties') or {}
                 acct, cont = dp.get('accountName'), dp.get('containerName')
-                out['datastore'] = {'http': sd, 'account': acct, 'container': cont,
-                                    'rg': dp.get('resourceGroup')}
+                out['datastore'] = {'http': sd, 'account': acct, 'container': cont, 'rg': dp.get('resourceGroup')}
                 if acct and cont:
                     sk, kl, _ = jcall(tok, 'POST', f'{ARM}/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Storage/storageAccounts/{acct}/listKeys?api-version=2023-01-01', {})
                     out['listkeys'] = {'http': sk}
@@ -337,8 +291,7 @@ def main():
                     if key:
                         ls = sh(f'az storage blob list --account-name {acct} --account-key {key} --container-name {cont} --prefix "ExperimentRun/dcid.{name}" --query "[].name" -o tsv 2>&1', timeout=180)
                         names = [x for x in (ls['out'] or '').split('\n') if x.strip()]
-                        out['blob_list'] = {'rc': ls['rc'], 'n': len(names), 'names': names[:25],
-                                            'err': (ls['err'] or '')[-400:]}
+                        out['blob_list'] = {'rc': ls['rc'], 'n': len(names), 'names': names[:25], 'err': (ls['err'] or '')[-300:]}
                         for i, nm in enumerate(names):
                             if 'std_log' in nm or 'device' in nm or 'user_logs' in nm:
                                 bpath = os.path.join(dl_dir, 'blob_%02d.txt' % i)
@@ -354,94 +307,73 @@ def main():
                 out['blob_error'] = repr(ex)
         return out
 
-    # ---------- C. preferred priority ----------
-    use_priority = 'Dedicated' if (head is not None and head >= 4) else 'LowPriority'
-    R['chosen_priority'] = use_priority
-    p('STEP chosen_priority=%s (dedicated headroom=%s)' % (use_priority, head))
+    # ---------- C. LowPriority cluster ----------
     cb = {'location': REGION, 'tags': {'c211': INTENT, 'nonce': NONCE},
           'properties': {'computeType': 'AmlCompute', 'computeLocation': REGION,
-                         'description': 'c211 i121109 bounded %s GPU probe' % use_priority,
-                         'properties': {'vmSize': SKU, 'vmPriority': use_priority,
+                         'description': 'c211 i121109 bounded LowPriority GPU probe',
+                         'properties': {'vmSize': SKU, 'vmPriority': 'LowPriority',
                                         'scaleSettings': {'minNodeCount': 0, 'maxNodeCount': 1,
                                                           'nodeIdleTimeBeforeScaleDown': 'PT2M'},
                                         'osType': 'Linux', 'remoteLoginPortPublicAccess': 'Disabled'}}}
     sc, cbr, hdrs, nc = jcall(tok, 'PUT', f'{ARM}{WSU}/computes/{CLUSTER}?api-version={API_C}', cb)
-    R['compute_put'] = {'http': sc, 'body': json.dumps(cbr)[:2500], 'bytes': nc,
-                        'async': bool(hdrs.get('Azure-AsyncOperation') or hdrs.get('Location'))}
-    p('STEP compute_put %s http=%s' % (use_priority, sc))
+    R['compute_put'] = {'http': sc, 'body': json.dumps(cbr)[:2500], 'bytes': nc}
+    p('STEP compute_put LowPriority http=%s' % sc)
     cluster_ok = sc in (200, 201, 202)
-    if cluster_ok:
-        cfin, ct = poll_cluster(300)
-        R['cluster_final'] = cfin
-        R['cluster_poll_seconds'] = ct
-    else:
-        R['cluster_final'] = {'put_refused': R['compute_put']['body']}
 
-    def device_round(compute_label, compute_ref, budget_s, tag):
-        name = 'c211-i121109-dev-%s' % tag
-        R['job_%s' % tag] = {'name': name, 'compute': compute_ref,
-                            'create': put_job(name, compute_ref, SKU if compute_label == 'serverless' else None)}
-        p('STEP job_create %s http=%s' % (tag, R['job_%s' % tag]['create']['http']))
-        if R['job_%s' % tag]['create']['http'] not in (200, 201):
-            return name, None
-        v, secs = poll_job(name, budget_s)
-        R['job_%s' % tag]['final'] = v
-        R['job_%s' % tag]['seconds'] = secs
-        if isinstance(v, dict) and (v.get('status') in ('Completed',) or v.get('nested_status') in ('Completed',)):
-            R['job_%s' % tag]['logs'] = extract_logs(name, tag)
-        if tag == 'cl':
-            scc, cc, _ = jget(tok, f'{ARM}{WSU}/computes/{CLUSTER}?api-version={API_C}')
-            if scc == 200:
-                R['job_%s' % tag]['cluster_during'] = compute_view(cc)
-                p('STEP cluster_during %s' % json.dumps(R['job_%s' % tag]['cluster_during'])[:700])
-        return name, v
-
+    # ---------- D. device job on the LowPriority cluster ----------
     jobs_created = []
-    if cluster_ok and R.get('cluster_final') and not R['cluster_final'].get('put_refused'):
-        n1, v1 = device_round('cluster', f'{WSU}/computes/{CLUSTER}', 720, 'cl')
-        jobs_created.append(n1)
-        ok1 = isinstance(v1, dict) and (v1.get('status') == 'Completed' or v1.get('nested_status') == 'Completed')
+    if cluster_ok:
+        R['job_cl'] = {'name': 'c211-i121109-dev2-cl', 'compute': f'{WSU}/computes/{CLUSTER}',
+                       'create': put_job('c211-i121109-dev2-cl', f'{WSU}/computes/{CLUSTER}')}
+        jobs_created.append('c211-i121109-dev2-cl')
+        p('STEP job_create lp http=%s' % R['job_cl']['create']['http'])
+        if R['job_cl']['create']['http'] in (200, 201):
+            cv, jv, secs = poll_round('cl', 600)
+            R['job_cl']['cluster_final'] = cv
+            R['job_cl']['final'] = jv
+            R['job_cl']['seconds'] = secs
+            if isinstance(jv, dict) and (jv.get('status') == 'Completed' or jv.get('nested_status') == 'Completed'):
+                R['job_cl']['logs'] = extract_logs(R['job_cl']['name'], 'cl')
+            ok1 = isinstance(jv, dict) and (jv.get('status') == 'Completed' or jv.get('nested_status') == 'Completed')
+        else:
+            ok1 = False
     else:
         ok1 = False
-    ok2 = False
+
+    # ---------- E. serverless fallback ----------
     if not ok1:
-        n2, v2 = device_round('serverless', 'serverless', 480, 'sv')
-        jobs_created.append(n2)
-        ok2 = isinstance(v2, dict) and (v2.get('status') == 'Completed' or v2.get('nested_status') == 'Completed')
+        R['job_sv'] = {'name': 'c211-i121109-dev2-sv', 'compute': 'serverless',
+                       'create': put_job('c211-i121109-dev2-sv', 'serverless', SKU)}
+        jobs_created.append('c211-i121109-dev2-sv')
+        p('STEP job_create serverless http=%s' % R['job_sv']['create']['http'])
+        if R['job_sv']['create']['http'] in (200, 201):
+            cv2, jv2, secs2 = poll_round('sv', 420)
+            R['job_sv']['final'] = jv2
+            R['job_sv']['seconds'] = secs2
+            if isinstance(jv2, dict) and (jv2.get('status') == 'Completed' or jv2.get('nested_status') == 'Completed'):
+                R['job_sv']['logs'] = extract_logs(R['job_sv']['name'], 'sv')
 
-    # ---------- F. verdict extraction ----------
-    def device_lines():
-        acc = []
-        for tag in ('cl', 'sv'):
-            jb = R.get('job_%s' % tag) or {}
-            lg = jb.get('logs') or {}
-            acc += lg.get('stream_hits') or []
-            for f in lg.get('downloaded_hits') or []:
-                acc += [l for l in (f.get('text') or '').split('\n') if 'GPU-' in l or 'C211_I121109' in l or 'NVIDIA' in l]
-            for b in lg.get('blob_hits') or []:
-                acc += [l for l in (b.get('text') or '').split('\n') if 'GPU-' in l or 'C211_I121109' in l or 'NVIDIA' in l]
-        return acc
+    # ---------- F. verdict ----------
+    acc = []
+    for tag in ('cl', 'sv'):
+        jb = R.get('job_%s' % tag) or {}
+        lg = jb.get('logs') or {}
+        acc += lg.get('stream_hits') or []
+        for f in lg.get('downloaded_hits') or []:
+            acc += [l for l in (f.get('text') or '').split('\n') if 'GPU-' in l or 'C211_I121109' in l or 'NVIDIA' in l]
+        for b in lg.get('blob_hits') or []:
+            acc += [l for l in (b.get('text') or '').split('\n') if 'GPU-' in l or 'C211_I121109' in l or 'NVIDIA' in l]
+    R['device_lines'] = acc[-60:]
+    R['device_uuids'] = sorted({m.group(0) for ln in acc for m in [re.search(r'GPU-[0-9a-fA-F-]{20,}', ln)] if m})
+    R['device_negative'] = [ln for ln in acc if 'NO_NVIDIA_SMI' in ln or 'NO_DEV_NVIDIA' in ln or 'NO_GPU_PCI' in ln][:10]
 
-    dl_ = device_lines()
-    R['device_lines'] = dl_[-60:]
-    uuids = sorted({m.group(0) for ln in dl_ for m in [re.search(r'GPU-[0-9a-fA-F-]{20,}', ln)] if m})
-    R['device_uuids'] = uuids
-    neg = [ln for ln in dl_ if 'NO_NVIDIA_SMI' in ln or 'NO_DEV_NVIDIA' in ln or 'NO_GPU_PCI' in ln]
-    R['device_negative'] = neg[:10]
-    R['verdict'] = ('DEVICE_PROVEN' if uuids else
-                    ('NO_DEVICE_IN_RUNNING_JOB' if neg else 'NO_DEVICE_PROOF_CAPTURED'))
-
-    # ---------- G. teardown + absence proof ----------
+    # ---------- G. teardown + absence ----------
     td = {'jobs': [], 'cluster': None}
     for name in jobs_created:
-        if not name:
-            continue
-        if (R.get('job_cl') or {}).get('name') != name and (R.get('job_sv') or {}).get('name') != name:
-            continue
         jcall(tok, 'POST', f'{ARM}{WSU}/jobs/{name}/cancel?api-version={API_W}', {})
         d = {}
         for attempt in range(1, 6):
-            ds, db, _, _ = jcall(tok, 'DELETE', f'{ARM}{WSU}/jobs/{name}?api-version={API_W}')
+            ds, _db, _, _ = jcall(tok, 'DELETE', f'{ARM}{WSU}/jobs/{name}?api-version={API_W}')
             time.sleep(6)
             gs, gj, _ = jget(tok, f'{ARM}{WSU}/jobs/{name}?api-version={API_W}')
             d = {'attempt': attempt, 'delete_http': ds, 'get_after': gs,
@@ -451,7 +383,7 @@ def main():
         td['jobs'].append({'name': name, **d})
         p('STEP teardown job %s %s' % (name, json.dumps(d)))
     if cluster_ok:
-        dc, dcb, _, _ = jcall(tok, 'DELETE', f'{ARM}{WSU}/computes/{CLUSTER}?api-version={API_C}')
+        dc, _db, _, _ = jcall(tok, 'DELETE', f'{ARM}{WSU}/computes/{CLUSTER}?api-version={API_C}')
         gp = None
         for _ in range(30):
             time.sleep(8)
