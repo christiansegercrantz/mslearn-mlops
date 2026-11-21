@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -333,15 +334,22 @@ def main():
         else:
             R['job_lp']['create_refused'] = True
 
-    # ---------- D. serverless job with the LONGER wait ----------
-    R['job_sv'] = {'name': 'c211-i121196-sv', 'create': put_job('c211-i121196-sv', 'serverless', SKU)}
-    jobs_created.append('c211-i121196-sv')
-    p('STEP job_create serverless http=%s' % R['job_sv']['create']['http'])
-    if R['job_sv']['create']['http'] in (200, 201):
-        cv2, jv2, secs2, bodies2 = poll_round('sv', 'c211-i121196-sv', SV_WAIT, poll_cluster=False)
-        R['job_sv'].update({'final': jv2, 'seconds': secs2, 'bodies': bodies2[-3:]})
-        if isinstance(jv2, dict) and (jv2.get('status') == 'Completed' or jv2.get('nested_status') == 'Completed'):
-            R['job_sv']['logs'] = extract_logs('c211-i121196-sv', 'sv')
+    # ---------- D. serverless job with the LONGER wait (only when LP produced no device) ----------
+    jlp = R.get('job_lp') or {}
+    lp_ok = isinstance(jlp.get('final'), dict) and (
+        jlp['final'].get('status') == 'Completed' or jlp['final'].get('nested_status') == 'Completed')
+    R['lp_completed'] = lp_ok
+    if not lp_ok:
+        R['job_sv'] = {'name': 'c211-i121196-sv', 'create': put_job('c211-i121196-sv', 'serverless', SKU)}
+        jobs_created.append('c211-i121196-sv')
+        p('STEP job_create serverless http=%s' % R['job_sv']['create']['http'])
+        if R['job_sv']['create']['http'] in (200, 201):
+            cv2, jv2, secs2, bodies2 = poll_round('sv', 'c211-i121196-sv', SV_WAIT, poll_cluster=False)
+            R['job_sv'].update({'final': jv2, 'seconds': secs2, 'bodies': bodies2[-3:]})
+            if isinstance(jv2, dict) and (jv2.get('status') == 'Completed' or jv2.get('nested_status') == 'Completed'):
+                R['job_sv']['logs'] = extract_logs('c211-i121196-sv', 'sv')
+    else:
+        p('STEP serverless_skipped lp_completed=true')
 
     # ---------- device verdict ----------
     acc = []
