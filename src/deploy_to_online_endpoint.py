@@ -12,7 +12,7 @@
 """
 import argparse, base64, json, os, random, re, string, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 
-INTENT = 'i120447'
+INTENT = 'i120447r2'
 def p(*a): print(*a, flush=True)
 def prog(step, **kw):
     try: p('C211_%s_PROGRESS ' % INTENT + json.dumps({'step': step, 't': time.strftime('%FT%TZ', time.gmtime()), **kw})[:3500])
@@ -185,7 +185,7 @@ def main():
     IMAGES = [{'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts', 'version': 'latest'},
               {'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts-gen2', 'version': 'latest'}]
     dev_evidence = None
-    for score, region, sinfo, avail in cands[:3]:
+    for score, region, sinfo, avail in cands[:6]:
         sku = sinfo['sku']
         pre = 'c211-' + INTENT + '-' + nonce
         vnet = pre + '-' + region + '-vnet'; sn = pre + '-' + region + '-subnet'; nic = pre + '-' + region + '-nic'; vm = pre + '-' + region + '-vm'
@@ -259,7 +259,10 @@ def main():
             if s3 in (200, 201): break
             if s3 != 400: break
         if s3 not in (200, 201):
+            ecode = (((r3 or {}).get('error') or {}).get('code') or '')
             cleanup(tok, sub, RG, vnet=vnet, nic=nic, vm=None, R=R)
+            if any(k in ecode.lower() for k in ('skunotavailable', 'allocation', 'notavailableforsubscription', 'operationnotallowed', 'quota')):
+                continue
             continue
         # ---- provisioning ----
         ok = False; prov = None; ivstat = None
@@ -319,8 +322,12 @@ def main():
         if dev_evidence and dev_evidence.get('signals'):
             break
         # if provisioning failed with a capacity-ish error, try the next region; else stop
-        capish = any((x.get('code') or '').lower() in ('skunotavailable', 'zonalallocationfailed', 'allocationfailed', 'operationnotallowed')
-                     for x in (ivstat or []))
+        def _capish(code):
+            c = (code or '').lower()
+            return any(k in c for k in ('allocationfailed', 'skunotavailable', 'zonalallocationfailed',
+                                        'operationnotallowed', 'notavailableforsubscription', 'quotaexceeded',
+                                        'insufficientcapacity'))
+        capish = any(_capish(x.get('code')) for x in (ivstat or []))
         if ok or not capish:
             break
     R['rg_resources_after'] = list_rg_resources(tok, sub, RG)
