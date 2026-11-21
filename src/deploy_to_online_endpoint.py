@@ -12,7 +12,7 @@
 """
 import argparse, base64, json, os, random, re, string, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 
-INTENT = 'i120447r3'
+INTENT = 'i120447r4'
 def p(*a): print(*a, flush=True)
 def prog(step, **kw):
     try: p('C211_%s_PROGRESS ' % INTENT + json.dumps({'step': step, 't': time.strftime('%FT%TZ', time.gmtime()), **kw})[:3500])
@@ -129,21 +129,43 @@ def main():
     for s in (cat.get('value') or []):
         nm = s.get('name', '')
         if not GPU_RE.match(nm): continue
-        if [r for r in (s.get('restrictions') or []) if r.get('type') == 'Location']: continue
         caps = {c.get('name'): c.get('value') for c in (s.get('capabilities') or [])}
         try: vc = int(caps.get('vCPUs') or 999)
         except Exception: vc = 999
-        zrestr = [r for r in (s.get('restrictions') or []) if r.get('type') == 'Zone']
+        restr = s.get('restrictions') or []
+        loc_restr = []
+        for r in restr:
+            if r.get('type') == 'Location':
+                for l in ((r.get('restrictionInfo') or {}).get('locations') or []):
+                    l2 = l.lower().replace(' ', '')
+                    if l2 not in loc_restr: loc_restr.append(l2)
+        zrestr = [r for r in restr if r.get('type') == 'Zone']
         zones = []
         for r in zrestr:
             for z in ((r.get('restrictionInfo') or {}).get('zones') or []):
                 if z not in zones: zones.append(z)
         skus.append({'sku': nm, 'family': s.get('family'), 'vcpus': vc, 'gpus': caps.get('GPUs'),
-                     'gpu_name': caps.get('GPU'), 'locs': s.get('locations') or [], 'zones': zones})
+                     'gpu_name': caps.get('GPU'), 'locs': [l.lower().replace(' ', '') for l in (s.get('locations') or [])],
+                     'loc_restr': loc_restr, 'zones': zones})
     R['gpu_skus_offered'] = len(skus)
-    pref_regions = ['westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus', 'eastus2']
+    _m = sorted(skus, key=lambda x: (x['vcpus'], x['sku']))
+    R['gpu_sku_matrix_total'] = len(_m)
+    R['gpu_sku_matrix'] = [{'sku': s['sku'], 'family': s['family'], 'vcpus': s['vcpus'], 'gpus': s['gpus'], 'gpu': s['gpu_name'],
+                            'n_locs': len(s['locs']), 'locs': s['locs'][:8], 'n_loc_restr': len(s['loc_restr']),
+                            'loc_restr': s['loc_restr'][:5], 'zones': s['zones'][:4]} for s in _m[:40]]
+    regions = set()
+    for s in skus:
+        for l in s['locs']:
+            if re.match(r'^[a-z]{4,}[a-z0-9]*$', l) and not l.startswith(('att', 'usgov', 'usnat', 'ussec', 'usstage')):
+                regions.add(l)
+    pref_order = ['westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus', 'eastus2',
+                  'japaneast', 'australiaeast', 'centralindia', 'francecentral', 'germanywestcentral', 'uksouth',
+                  'koreacentral', 'northcentralus', 'southcentralus', 'italynorth', 'polandcentral', 'spaincentral',
+                  'chilecentral', 'mexicocentral', 'brazilsouth', 'westus3', 'westus']
+    pref_regions = [r for r in pref_order if r in regions] + sorted(regions - set(pref_order))
+    R['candidate_regions'] = pref_regions
     qmap = {}
-    for reg in pref_regions:
+    for reg in pref_regions[:24]:
         stu, us = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Compute/locations/{reg}/usages?api-version=2024-07-01')
         if stu != 200:
             qmap[reg] = {'status': stu}; continue
@@ -159,10 +181,13 @@ def main():
         f2 = (f or '').lower().replace(' ', '').replace('_', '')
         f2 = re.sub(r'^standard', '', f2); f2 = re.sub(r'family$', '', f2)
         return f2
+    TESTED_ALLOCFAIL = {'westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus2'}
+    LEGACY_SMALL = ('Standard_NC6', 'Standard_NV6', 'Standard_NC12', 'Standard_NV12')
     cands = []
     for s in skus:
-        for reg in pref_regions:
-            if not any(l.lower().replace(' ', '') == reg for l in s['locs']): continue
+        for reg in pref_regions[:24]:
+            if reg not in s['locs']: continue
+            if reg in s['loc_restr']: continue
             q = qmap.get(reg, {})
             if q.get('status') != 200: continue
             avail = None
@@ -170,22 +195,25 @@ def main():
                 if fam_key(qf) == fam_key(s['family']):
                     avail = qv['limit'] - qv['current']; break
             if avail is None or s['vcpus'] > avail: continue
-            score = (0 if s['sku'] == 'Standard_NV4as_v4' else 1, pref_regions.index(reg), s['vcpus'])
-            cands.append((score, reg, s, avail))
+            sku_rank = 0 if s['sku'] == 'Standard_NV4as_v4' else (1 if s['sku'] in LEGACY_SMALL else 2)
+            cands.append(((sku_rank, 1 if reg in TESTED_ALLOCFAIL else 0,
+                           pref_regions.index(reg) if reg in pref_regions else 99, s['vcpus']), reg, s, avail))
     cands.sort(key=lambda x: x[0])
     R['sel_candidates'] = [{'region': c[1], 'sku': c[2]['sku'], 'family': c[2]['family'], 'vcpus': c[2]['vcpus'],
-                            'gpus': c[2]['gpus'], 'gpu_name': c[2]['gpu_name'], 'avail': c[3]} for c in cands[:12]]
-    prog('selection', sel_candidates=R['sel_candidates'])
+                            'gpus': c[2]['gpus'], 'gpu_name': c[2]['gpu_name'], 'avail': c[3],
+                            'tested_allocfail': c[1] in TESTED_ALLOCFAIL} for c in cands[:20]]
+    prog('selection', n_candidates=len(cands), sel_candidates=R['sel_candidates'])
+
     marker = {'attempted': False}; R['marker'] = marker
     nonce = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-    marker['nonce'] = nonce; marker['priority'] = 'Spot'
+    marker['nonce'] = nonce
     attempts = []
     R['attempts'] = attempts
     # image fallback: gen1 first (max compatibility), gen2 only if ARM refuses the image
     IMAGES = [{'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts', 'version': 'latest'},
               {'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts-gen2', 'version': 'latest'}]
     dev_evidence = None
-    for score, region, sinfo, avail in cands[:3]:
+    for score, region, sinfo, avail in cands[:8]:
         sku = sinfo['sku']
         pre = 'c211-' + INTENT + '-' + nonce
         vnet = pre + '-' + region + '-vnet'; sn = pre + '-' + region + '-subnet'; nic = pre + '-' + region + '-nic'; vm = pre + '-' + region + '-vm'
@@ -236,8 +264,7 @@ def main():
         img_used = None
         for im in IMAGES:
             vmb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
-                   'properties': {'priority': 'Spot', 'evictionPolicy': 'Deallocate', 'billingProfile': {'maxPrice': -1},
-                                  'hardwareProfile': {'vmSize': sku},
+                   'properties': {'hardwareProfile': {'vmSize': sku},
                     'storageProfile': {'imageReference': im,
                                        'osDisk': {'createOption': 'FromImage', 'managedDisk': {'storageAccountType': 'Standard_LRS'}, 'deleteOption': 'Delete'}},
                     'osProfile': {'computerName': ('c211' + nonce)[:15], 'adminUsername': 'c211probe', 'adminPassword': pw,
@@ -387,10 +414,11 @@ def emit(R):
                 'rg_resources_before': {k: (R.get('rg_resources_before') or {}).get(k) for k in ('status', 'count', 'ours')},
                 'preclean': R.get('preclean'), 'preclean_after': R.get('preclean_after'),
                 'sku_catalog_count': R.get('sku_catalog_count'), 'gpu_skus_offered': R.get('gpu_skus_offered'),
+                'gpu_sku_matrix': R.get('gpu_sku_matrix'), 'candidate_regions': R.get('candidate_regions'),
                 'sel_candidates': R.get('sel_candidates'),
                 'attempts': [{k: v for k, v in a.items() if k != 'steps'} | {'step_statuses': {kk: st(vv) for kk, vv in (a.get('steps') or {}).items()}}
                              for a in (R.get('attempts') or [])],
-                'marker': {k: R.get('marker', {}).get(k) for k in ('attempted', 'nonce', 'priority', 'region', 'sku', 'gpu_name', 'provision_state', 'provisioned',
+                'marker': {k: R.get('marker', {}).get(k) for k in ('attempted', 'nonce', 'region', 'sku', 'gpu_name', 'provision_state', 'provisioned',
                                                                   'instance_view_statuses', 'runcommand_status', 'device_signals', 'device_evidence',
                                                                   'list_with_marker', 'tag_readback', 'vm_get', 'cleanup')},
                 'rg_resources_after': {k: (R.get('rg_resources_after') or {}).get(k) for k in ('status', 'count', 'ours')},
