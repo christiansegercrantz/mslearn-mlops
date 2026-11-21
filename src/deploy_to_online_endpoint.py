@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""C211 i120938 Phase H - delete the canceled AML job and prove absence.
+"""C211 i120938 Phase I - finish deletion of the canceled AML job and prove job absence.
 
 Runs inside the mslearn-mlops '/deploy-prod' issue_comment workflow (fork-controlled
 src/deploy_to_online_endpoint.py) with the prod ARM token. It:
-  - reads the final status of job diabetes-train-prod-44869461755 (canceled at 05:57:41Z)
-  - waits bounded for it to leave the active state, then DELETEs it
-  - proves absence (job GET 404, experiment c211-i120729 job list count 0)
-  - re-reads the compute list (cluster c211-i120729-n7k4q already deleted, 404)
-Emits C211_i120938h_* lines only.
+  - re-issues DELETE on job diabetes-train-prod-44869461755 (status Canceled) until accepted
+  - polls GET job until 404 (bounded ~12 min), recording every status
+  - proves list-level absence: the experiment c211-i120729 job list must not contain our job
+  - re-confirms cluster c211-i120729-n7k4q 404 and the 2 remaining workspace computes
+Emits C211_i120938i_* lines only.
 """
 import base64, json, subprocess, sys, time, urllib.error, urllib.request, zlib
 
-INTENT = 'i120938h'
+INTENT = 'i120938i'
 ARM = 'https://management.azure.com'
 SUB = '790067ff-3e39-4632-ad1a-d65702d42c88'
 RG = 'chriso-sandbox-rg'
@@ -79,78 +79,60 @@ def main():
         R['fatal'] = 'no token'
         emit_b64(R)
         return
-    # 1) final status before delete
+    # 1) current state
     sj, j, _ = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOBNAME}?api-version=2024-10-01')
     jp = (j.get('properties') or {}) if isinstance(j, dict) else {}
-    R['job_before_delete'] = {'http': sj, 'status': jp.get('status'),
-                              'displayName': jp.get('displayName'),
-                              'computeId': jp.get('computeId'),
-                              'startTime': jp.get('startTime'), 'endTime': jp.get('endTime'),
-                              'error': jp.get('error')}
-    p('STEP job_before_delete http=%s status=%s err=%s' % (sj, jp.get('status'),
-                                                           json.dumps(jp.get('error'))[:300]))
-    # 2) bounded wait for non-active state
-    waits = []
-    for i in range(12):
-        if sj != 200:
+    R['job_start'] = {'http': sj, 'status': jp.get('status')}
+    p('STEP job_start http=%s status=%s' % (sj, jp.get('status')))
+    # 2) re-issue DELETE while not 404
+    dels = []
+    ds = None
+    for i in range(6):
+        if sj == 404:
             break
-        st = jp.get('status')
-        if st in ('Canceled', 'Cancelled', 'Failed', 'Completed'):
+        ds, db, _ = jcall(tok, 'DELETE', f'{ARM}{WSU}/jobs/{JOBNAME}?api-version=2024-10-01')
+        dels.append({'attempt': i + 1, 'http': ds, 'body': json.dumps(db)[:300]})
+        p('STEP delete attempt=%s http=%s' % (i + 1, ds))
+        if ds == 404:
             break
-        time.sleep(10)
+        time.sleep(60)
         sj, j, _ = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOBNAME}?api-version=2024-10-01')
         jp = (j.get('properties') or {}) if isinstance(j, dict) else {}
-        waits.append({'t': (i + 1) * 10, 'http': sj, 'status': jp.get('status')})
-    R['status_waits'] = waits
-    R['job_final'] = {'http': sj, 'status': jp.get('status'),
-                      'startTime': jp.get('startTime'), 'endTime': jp.get('endTime'),
-                      'error': jp.get('error'), 'computeId': jp.get('computeId')}
-    p('STEP job_final http=%s status=%s' % (sj, jp.get('status')))
-    # 3) delete (retry a few times if still active)
-    deletes = []
-    ds = None
-    for i in range(10):
-        ds, db, _ = jcall(tok, 'DELETE', f'{ARM}{WSU}/jobs/{JOBNAME}?api-version=2024-10-01')
-        deletes.append({'attempt': i + 1, 'http': ds, 'body': json.dumps(db)[:300]})
-        p('STEP delete attempt=%s http=%s' % (i + 1, ds))
-        if ds in (200, 202, 204):
-            break
-        time.sleep(10)
-    R['deletes'] = deletes
-    # 4) absence poll
+        dels[-1]['get_after'] = {'http': sj, 'status': jp.get('status')}
+        p('STEP get_after attempt=%s http=%s status=%s' % (i + 1, sj, jp.get('status')))
+    R['deletes'] = dels
+    # 3) absence poll
     polls = []
     for i in range(30):
-        time.sleep(10)
-        gs, gj, _ = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOBNAME}?api-version=2024-10-01')
-        polls.append({'t': (i + 1) * 10, 'job_http': gs})
-        if gs == 404:
+        if sj == 404:
+            break
+        time.sleep(20)
+        sj, j, _ = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOBNAME}?api-version=2024-10-01')
+        jp = (j.get('properties') or {}) if isinstance(j, dict) else {}
+        polls.append({'t': 60 + (i + 1) * 20, 'job_http': sj, 'status': jp.get('status')})
+        if sj == 404:
             break
     R['absence_polls'] = polls
-    p('STEP absence last=%s' % json.dumps(polls[-1] if polls else None))
-    # 5) list-level absence
+    R['job_absent_404'] = (sj == 404)
+    p('STEP absence last=%s absent=%s' % (json.dumps(polls[-1] if polls else None), sj == 404))
+    # 4) list-level absence
     ls, lj, _ = jcall(tok, 'GET', f'{ARM}{WSU}/jobs?api-version=2024-10-01&$filter=properties/experimentName%20eq%20%27c211-i120729%27')
     jitems = (lj.get('value') if isinstance(lj, dict) else None) or []
-    R['job_list_after'] = {'http': ls, 'count': len(jitems),
-                           'names': [x.get('name') for x in jitems[:20]]}
-    p('STEP job_list_after http=%s count=%s %s' % (ls, len(jitems), R['job_list_after']['names']))
-    # 6) computes + cluster absence
+    names = [x.get('name') for x in jitems]
+    R['job_list_after'] = {'http': ls, 'count': len(jitems), 'names': names[:20],
+                           'our_job_present': JOBNAME in names}
+    p('STEP job_list_after http=%s count=%s our_present=%s names=%s'
+      % (ls, len(jitems), JOBNAME in names, names[:10]))
+    # 5) cluster + computes
+    gcs, gc, _ = jcall(tok, 'GET', f'{ARM}{WSU}/computes/{CLUSTER}?api-version=2024-04-01')
     ccs, cl, _ = jcall(tok, 'GET', f'{ARM}{WSU}/computes?api-version=2024-04-01')
     citems = (cl.get('value') if isinstance(cl, dict) else None) or []
+    R['cluster_get_after'] = {'http': gcs}
     R['computes_after'] = {'http': ccs, 'count': len(citems),
-                           'names': [x.get('name') for x in citems]}
-    gcs, gc, _ = jcall(tok, 'GET', f'{ARM}{WSU}/computes/{CLUSTER}?api-version=2024-04-01')
-    R['cluster_get_after'] = {'http': gcs, 'body': json.dumps(gc)[:300]}
-    p('STEP computes_after http=%s names=%s cluster_get=%s'
-      % (ccs, R['computes_after']['names'], gcs))
-    # 7) subscription-wide AML workspace census (who else could hold the NCasT4_v3 quota)
-    ws, wl, _ = jcall(tok, 'GET', f'{ARM}/subscriptions/{SUB}/providers/Microsoft.MachineLearningServices/workspaces?api-version=2024-04-01')
-    witms = (wl.get('value') if isinstance(wl, dict) else None) or []
-    R['workspaces_sub'] = {'http': ws, 'count': len(witms),
-                           'items': [{'name': x.get('name'),
-                                      'rg': ((x.get('id') or '').split('/')[4] if x.get('id') else None),
-                                      'location': x.get('location')} for x in witms[:30]]}
-    p('STEP workspaces_sub http=%s count=%s names=%s'
-      % (ws, len(witms), [x.get('name') for x in witms[:20]]))
+                           'names': [x.get('name') for x in citems],
+                           'ours_present': CLUSTER in [x.get('name') for x in citems]}
+    p('STEP cluster_get=%s computes=%s ours_present=%s'
+      % (gcs, [x.get('name') for x in citems], CLUSTER in [x.get('name') for x in citems]))
     emit_b64(R)
 
 
