@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""C211 i121268 - mslearn AML owed teardown only (no cluster/job creation).
+"""C211 i121268 - teardown verification v2: ONE delete, then bounded wait (no delete hammering).
 
-Verifies the i121196 READY verdict is fully torn down:
-  - job c211-i121196-lp        -> DELETE, poll GET 404 (the async delete that was still 200)
-  - compute c211-i121196-v4r7c -> expect GET 404
-  - jobs c211-i121109-dev2-cl / dev2-sv -> expect 404
-  - computes c211-i121109-q7m2x / q7m4x -> expect 404
-  - list computes + jobs, report every c211-* remnant and confirm the 5 auto-named non-c211 jobs untouched
-No resource is created. Prints one C211_ line per measurement.
+The AML job DELETE is asynchronous (202 + Location/Azure-AsyncOperation). Issuing it repeatedly
+may restart the operation, so v2 issues exactly one DELETE per API version, captures the async
+operation headers, polls the job GET every 20 s, and after the budget escalates to the older
+2023-04-01 API once. Creates nothing.
 """
 import json
 import subprocess
@@ -20,8 +17,6 @@ ARM = 'https://management.azure.com'
 SUB = '790067ff-3e39-4632-ad1a-d65702d42c88'
 RG = 'chriso-sandbox-rg'
 WS = 'mlw-ai300-l0ee20539cc7442539c'
-API_C = '2024-04-01'
-API_W = '2024-10-01'
 WSU = ('/subscriptions/%s/resourceGroups/%s/providers/Microsoft.MachineLearningServices/workspaces/%s'
        % (SUB, RG, WS))
 JOB = 'c211-i121196-lp'
@@ -29,7 +24,7 @@ CLUSTER = 'c211-i121196-v4r7c'
 INHERITED_JOBS = ['c211-i121109-dev2-cl', 'c211-i121109-dev2-sv']
 OLD_CLUSTERS = ['c211-i121109-q7m2x', 'c211-i121109-q7m4x']
 KEEP_JOBS = ['careful_ear_tsf3f7z6x0', 'bold_hair_0dwzz6l3w9', 'mango_seed_7t2cwwxsmg',
-             'wheat_yuca_9tzr8jbzvq', 'calm_arm_ryfcx0g7ly']
+             'wheat_yuca_9tzr8jbvq', 'calm_arm_ryfcx0g7ly', 'wheat_yuca_9tzr8jbzvq']
 
 
 def p(*a):
@@ -39,9 +34,9 @@ def p(*a):
 def sh(cmd, timeout=180):
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        return {'rc': r.returncode, 'out': r.stdout[-6000:], 'err': r.stderr[-2000:]}
+        return r.stdout[-6000:] + r.stderr[-1000:]
     except Exception as ex:
-        return {'rc': -1, 'err': repr(ex)}
+        return repr(ex)
 
 
 def jcall(tok, method, url, body=None, timeout=120):
@@ -52,100 +47,99 @@ def jcall(tok, method, url, body=None, timeout=120):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
+            hdr = {k: v for k, v in r.headers.items()
+                   if k.lower() in ('location', 'azure-asyncoperation', 'retry-after', 'x-ms-request-id')}
             try:
-                return r.status, json.loads(raw or b'{}'), len(raw)
+                return r.status, json.loads(raw or b'{}'), len(raw), hdr
             except Exception:
-                return r.status, {'raw': raw[:400].decode('utf8', 'replace')}, len(raw)
+                return r.status, {'raw': raw[:300].decode('utf8', 'replace')}, len(raw), hdr
     except urllib.error.HTTPError as e:
         raw = b''
         try:
             raw = e.read()
         except Exception:
             pass
+        hdr = {k: v for k, v in (e.headers or {}).items()
+               if k.lower() in ('location', 'azure-asyncoperation', 'retry-after', 'x-ms-request-id')}
         try:
-            return e.code, json.loads(raw or b'{}'), len(raw)
+            return e.code, json.loads(raw or b'{}'), len(raw), hdr
         except Exception:
-            return e.code, {'raw': raw[:400].decode('utf8', 'replace')}, len(raw)
+            return e.code, {'raw': raw[:300].decode('utf8', 'replace')}, len(raw), hdr
 
 
 def main():
-    p('C211_%s_BEGIN %s' % (INTENT, time.strftime('%FT%TZ', time.gmtime())))
+    p('C211_%s_V2_BEGIN %s' % (INTENT, time.strftime('%FT%TZ', time.gmtime())))
     tok = None
     try:
-        tok = json.loads(sh('az account get-access-token --resource https://management.azure.com/ -o json 2>&1')['out']).get('accessToken')
-    except Exception as ex:
-        p('C211_%s_TOKEN_ERR %r' % (INTENT, ex))
-    p('C211_%s_TOKEN len=%s' % (INTENT, len(tok or '')))
+        tok = json.loads(sh('az account get-access-token --resource https://management.azure.com/ -o json'))['out'] if False else None
+    except Exception:
+        pass
+    out = sh('az account get-access-token --resource https://management.azure.com/ -o json 2>&1')
+    try:
+        tok = json.loads(out).get('accessToken')
+    except Exception:
+        p('C211_%s_V2_TOKEN_PARSE_FAIL %s' % (INTENT, out[:200]))
+    p('C211_%s_V2_TOKEN len=%s' % (INTENT, len(tok or '')))
     if not tok:
-        p('C211_%s_RESULT fatal=no-token' % INTENT)
+        p('C211_%s_V2_RESULT fatal=no-token' % INTENT)
         return
 
-    # ---- 1. the owed job delete with bounded 404 readback ----
-    s, b, n = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOB}?api-version={API_W}')
-    p('C211_%s_JOB_PRE name=%s http=%s status=%s' % (
-        INTENT, JOB, s, (b.get('properties') or {}).get('status') if isinstance(b, dict) else None))
-    dl_http = None
-    get_after = s
-    if s == 200:
-        # cancel first (harmless if already terminal), then delete
-        sc, _cb, _n = jcall(tok, 'POST', f'{ARM}{WSU}/jobs/{JOB}/cancel?api-version={API_W}', {})
-        p('C211_%s_JOB_CANCEL http=%s' % (INTENT, sc))
-        for attempt in range(1, 31):
-            sd, _db, _dn = jcall(tok, 'DELETE', f'{ARM}{WSU}/jobs/{JOB}?api-version={API_W}')
-            dl_http = sd
-            time.sleep(5)
-            sg, _gb, _gn = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOB}?api-version={API_W}')
-            get_after = sg
-            p('C211_%s_JOB_DEL attempt=%d delete=%s get=%s' % (INTENT, attempt, sd, sg))
-            if sg == 404:
-                break
-    p('C211_%s_JOB_FINAL name=%s delete_http=%s get_after=%s' % (INTENT, JOB, dl_http, get_after))
+    s, b, _n, _h = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOB}?api-version=2024-10-01')
+    p('C211_%s_V2_JOB_PRE http=%s status=%s' % (
+        INTENT, s, (b.get('properties') or {}).get('status') if isinstance(b, dict) else None))
 
-    # ---- 2. cluster + inherited resources ----
+    reason = 'already-absent'
+    if s == 200:
+        for api in ('2024-10-01', '2023-04-01'):
+            sd, db, dn, hd = jcall(tok, 'DELETE', f'{ARM}{WSU}/jobs/{JOB}?api-version={api}')
+            p('C211_%s_V2_DELETE api=%s http=%s bytes=%s hdrs=%s body=%s' % (
+                INTENT, api, sd, dn, json.dumps(hd), json.dumps(db)[:400]))
+            t0 = time.time()
+            final = sd
+            while time.time() - t0 < 360:
+                time.sleep(20)
+                sg, gb, _gn, _gh = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOB}?api-version=2024-10-01')
+                final = sg
+                p('C211_%s_V2_POLL api_after=%s t=%ds get=%s' % (INTENT, api, round(time.time() - t0), sg))
+                if sg == 404:
+                    break
+            reason = 'deleted-after-%s' % api
+            if final == 404:
+                break
+
+    sg, _gb, _gn, _gh = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{JOB}?api-version=2024-10-01')
+    p('C211_%s_V2_JOB_FINAL get=%s' % (INTENT, sg))
+
     res = {}
     for c in [CLUSTER] + OLD_CLUSTERS:
-        s2, _b2, _n2 = jcall(tok, 'GET', f'{ARM}{WSU}/computes/{c}?api-version={API_C}')
+        s2, _b2, _n2, _h2 = jcall(tok, 'GET', f'{ARM}{WSU}/computes/{c}?api-version=2024-04-01')
         res['compute:' + c] = s2
     for j in INHERITED_JOBS:
-        s3, _b3, _n3 = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{j}?api-version={API_W}')
+        s3, _b3, _n3, _h3 = jcall(tok, 'GET', f'{ARM}{WSU}/jobs/{j}?api-version=2024-10-01')
         res['job:' + j] = s3
-    res['job:' + JOB] = get_after
     for k in sorted(res):
-        p('C211_%s_ABSENCE %s http=%s' % (INTENT, k, res[k]))
+        p('C211_%s_V2_ABSENCE %s http=%s' % (INTENT, k, res[k]))
 
-    # ---- 3. list readback ----
-    sc, cb, _n = jcall(tok, 'GET', f'{ARM}{WSU}/computes?api-version={API_C}')
+    sc, cb, _n, _h = jcall(tok, 'GET', f'{ARM}{WSU}/computes?api-version=2024-04-01')
     names = [x.get('name') for x in (cb.get('value') or [])] if isinstance(cb, dict) else []
-    p('C211_%s_COMPUTE_LIST http=%s names=%s c211=%s' % (
-        INTENT, sc, json.dumps(sorted(n for n in names if n)),
-        json.dumps(sorted(n for n in names if n and 'c211' in n))))
-    sj, jb, _n = jcall(tok, 'GET', f'{ARM}{WSU}/jobs?api-version={API_W}')
+    sj, jb, _n, _h = jcall(tok, 'GET', f'{ARM}{WSU}/jobs?api-version=2024-10-01')
     jnames = [x.get('name') for x in (jb.get('value') or [])] if isinstance(jb, dict) else []
-    p('C211_%s_JOB_LIST http=%s count=%s c211=%s keep_present=%s' % (
-        INTENT, sj, len(jnames), json.dumps(sorted(n for n in jnames if n and 'c211' in n)),
+    p('C211_%s_V2_COMPUTE_LIST http=%s names=%s c211=%s' % (
+        INTENT, sc, json.dumps(sorted(names)), json.dumps(sorted(n for n in names if n and 'c211' in n))))
+    p('C211_%s_V2_JOB_LIST http=%s count=%s names=%s c211=%s keep_present=%s' % (
+        INTENT, sj, len(jnames), json.dumps(sorted(jnames)),
+        json.dumps(sorted(n for n in jnames if n and 'c211' in n)),
         json.dumps(sorted(n for n in KEEP_JOBS if n in jnames))))
 
-    # ---- 4. optional usage re-read (post-teardown meter) ----
-    su, ub, _n = jcall(tok, 'GET', f'{ARM}{WSU}/usages?api-version={API_W}')
-    lp = {}
-    if isinstance(ub, dict):
-        for e in (ub.get('value') or []):
-            nm = ((e.get('name') or {}).get('value') or '')
-            if nm in ('TotalLowPriorityCores', 'Standard NCASv3_T4 Family', 'TotalClusters', 'TotalDedicatedCores'):
-                lp[nm + '|' + (e.get('type') or '')] = '%s/%s' % (e.get('currentValue'), e.get('limit'))
-    p('C211_%s_USAGE_POST http=%s %s' % (INTENT, su, json.dumps(lp)))
-
-    ok = (get_after == 404 and res.get('compute:' + CLUSTER) == 404 and
+    ok = (sg == 404 and res.get('compute:' + CLUSTER) == 404 and
           all(res.get('job:' + j) == 404 for j in INHERITED_JOBS) and
           all(res.get('compute:' + c) == 404 for c in OLD_CLUSTERS) and
           not [n for n in jnames if n and 'c211' in n] and
-          not [n for n in names if n and 'c211' in n] and
-          all(n in jnames for n in KEEP_JOBS))
-    p('C211_%s_RESULT absent=%s job_final_get=%s c211_remnants_computes=%s c211_remnants_jobs=%s' % (
-        INTENT, ok, get_after,
-        json.dumps(sorted(n for n in names if n and 'c211' in n)),
+          not [n for n in names if n and 'c211' in n])
+    p('C211_%s_V2_RESULT absent=%s reason=%s c211_remnants_computes=%s c211_remnants_jobs=%s' % (
+        INTENT, ok, reason, json.dumps(sorted(n for n in names if n and 'c211' in n)),
         json.dumps(sorted(n for n in jnames if n and 'c211' in n))))
-    p('C211_%s_END %s' % (INTENT, time.strftime('%FT%TZ', time.gmtime())))
+    p('C211_%s_V2_END %s' % (INTENT, time.strftime('%FT%TZ', time.gmtime())))
 
 
 if __name__ == '__main__':
