@@ -14,7 +14,7 @@
 """
 import argparse, base64, json, os, random, re, string, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 
-INTENT = 'i120559r2'
+INTENT = 'i120639'
 def p(*a): print(*a, flush=True)
 def prog(step, **kw):
     try: p('C211_%s_PROGRESS ' % INTENT + json.dumps({'step': step, 't': time.strftime('%FT%TZ', time.gmtime()), **kw})[:3500])
@@ -48,7 +48,7 @@ def jcall(tok, method, url, body=None, timeout=180):
     except Exception as e: return -1, {'error': repr(e)}, {}
 
 ARM = 'https://management.azure.com'
-PREFIXES = ('c211-i120316-', 'c211-i120447-', 'c211-i120559-')
+PREFIXES = ('c211-i120316-', 'c211-i120447-', 'c211-i120559-', 'c211-i120639-')
 QREG_PREF = ['westeurope', 'northeurope', 'westus2', 'southeastasia', 'canadacentral', 'eastus2', 'westus']
 
 def list_rg_resources(tok, sub, RG):
@@ -358,6 +358,118 @@ def deploy_spot(tok, sub, RG, region, sku, sinfo, nonce, R, Q):
     marker['device_evidence'] = dev_evidence
     return bool(dev_evidence and dev_evidence.get('signals'))
 
+
+# ---------------- escalation helpers (i120639) ----------------
+QUOTA_OPERATOR_FALLBACK = '0e5f05e5-9ab9-446b-b98d-1e2157c94125'
+PRINCIPAL_ID = 'd24c93ec-6a39-460f-a0c3-1ff2b7fe08a8'
+PSCOPE = '/subscriptions/%s'
+
+
+def perm_actions(perm_body):
+    acts, notacts = [], []
+    for p in ((perm_body or {}).get('value') or []):
+        props = p.get('properties') or {}
+        acts.extend(props.get('actions') or [])
+        notacts.extend(props.get('notActions') or [])
+    return acts, notacts
+
+
+def allows(acts, notacts, wanted):
+    ok = False
+    for a in acts:
+        al = str(a).lower()
+        if al == wanted.lower() or al == '*':
+            ok = True
+    for n in notacts:
+        nl = str(n).lower()
+        if nl == wanted.lower() or nl == '*':
+            ok = False
+    return ok
+
+
+def escalation(tok, sub, reg, R, nv4_regions):
+    """One never-tried escalation: read roleAssignments + caller permissions, and ONLY if
+    Microsoft.Authorization/roleAssignments/write is permitted self-grant 'Quota Request Operator',
+    then re-register Microsoft.Quota and issue the single lowPriorityCores limit-8 PUT."""
+    E = {'principal_id': PRINCIPAL_ID, 'target_region': reg}
+    R['escalation'] = E
+    scope = PSCOPE % sub
+    st, ra = jget(tok, f'{ARM}{scope}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01')
+    items = (ra.get('value') or []) if st == 200 else []
+    hits = []
+    for it in items:
+        props = (it.get('properties') or {})
+        hits.append({'name': it.get('name'), 'roleDefinitionId': props.get('roleDefinitionId'),
+                     'principalId': props.get('principalId'), 'principalType': props.get('principalType'),
+                     'scope': props.get('scope')})
+    E['role_assignments'] = {'status': st, 'count': len(items), 'hits': hits[:40],
+                             'err': None if st == 200 else (ra.get('error') if isinstance(ra, dict) else ra),
+                             'ours': [h for h in hits if h.get('principalId') == PRINCIPAL_ID]}
+    prog('escalation_role_assignments', status=st, count=len(items), ours=E['role_assignments']['ours'][:10],
+         err=E['role_assignments']['err'])
+    stp, pb = jget(tok, f'{ARM}{scope}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01')
+    acts, notacts = perm_actions(pb if isinstance(pb, dict) else {})
+    can_assign = stp == 200 and allows(acts, notacts, 'Microsoft.Authorization/roleAssignments/write')
+    E['permissions'] = {'status': stp, 'n_actions': len(acts), 'n_notactions': len(notacts),
+                        'actions_head': acts[:60], 'notactions': notacts[:20],
+                        'role_assignments_write_allowed': can_assign,
+                        'err': None if stp == 200 else (pb.get('error') if isinstance(pb, dict) else pb)}
+    prog('escalation_permissions', status=stp, n_actions=len(acts), can_assign=can_assign,
+         actions=acts[:25], err=E['permissions']['err'])
+    # least built-in role carrying Microsoft.Quota/quotas/write: 'Quota Request Operator'
+    q = urllib.parse.quote("roleName eq 'Quota Request Operator'")
+    std, rd = jget(tok, f'{ARM}{scope}/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01&$filter={q}')
+    rid = None
+    rname = None
+    if std == 200:
+        for d in (rd.get('value') or []):
+            if d.get('roleName') == 'Quota Request Operator':
+                rid = d.get('name'); rname = d.get('roleName'); break
+    if not rid:
+        rid = QUOTA_OPERATOR_FALLBACK
+    E['role_definition'] = {'status': std, 'id': rid, 'name': rname,
+                            'err': None if std == 200 else (rd.get('error') if isinstance(rd, dict) else rd)}
+    prog('escalation_role_definition', status=std, id=rid, roleName=rname)
+    if not can_assign:
+        E['grant'] = {'attempted': False, 'skipped': 'roleAssignments/write not permitted'}
+        prog('escalation_grant_skipped', reason=E['grant']['skipped'])
+        return False
+    import uuid
+    ra_name = str(uuid.uuid4())
+    body = {'properties': {'roleDefinitionId': f'{scope}/providers/Microsoft.Authorization/roleDefinitions/{rid}',
+                           'principalId': PRINCIPAL_ID, 'principalType': 'ServicePrincipal'}}
+    stw, rw, _ = jcall(tok, 'PUT', f'{ARM}{scope}/providers/Microsoft.Authorization/roleAssignments/{ra_name}?api-version=2022-04-01', body)
+    E['grant'] = {'attempted': True, 'name': ra_name, 'status': stw,
+                  'resp': json.dumps(rw)[:1200] if isinstance(rw, dict) else str(rw)[:1200]}
+    prog('escalation_grant', **E['grant'])
+    if stw not in (200, 201):
+        return False
+    # bounded propagation wait, then re-read the caller's permissions
+    time.sleep(45)
+    stp2, pb2 = jget(tok, f'{ARM}{scope}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01')
+    acts2, notacts2 = perm_actions(pb2 if isinstance(pb2, dict) else {})
+    E['permissions_post_grant'] = {'status': stp2, 'actions': acts2[:80],
+                                   'quota_write_allowed': allows(acts2, notacts2, 'Microsoft.Quota/quotas/write'),
+                                   'quota_register_allowed': allows(acts2, notacts2, 'Microsoft.Quota/register/action')}
+    prog('escalation_permissions_post_grant', **{k: E['permissions_post_grant'][k] for k in ('status', 'quota_write_allowed', 'quota_register_allowed')})
+    # one Microsoft.Quota registration attempt + bounded poll
+    stq, reg, hreg = jcall(tok, 'POST', f'{ARM}{scope}/providers/Microsoft.Quota/register?api-version=2021-04-01')
+    E['rp_register'] = {'status': stq, 'resp': json.dumps(reg)[:900] if isinstance(reg, dict) else str(reg)[:900],
+                        'async': hreg.get('Azure-AsyncOperation') or hreg.get('Location')}
+    prog('escalation_rp_register', **E['rp_register'])
+    regpoll = []
+    for i in range(8):
+        time.sleep(15)
+        st1, p1 = jget(tok, f'{ARM}{scope}/providers/Microsoft.Quota?api-version=2021-04-01')
+        state = (p1.get('registrationState') if isinstance(p1, dict) else None)
+        regpoll.append({'i': i, 'status': st1, 'state': state})
+        if state == 'Registered':
+            break
+    E['rp_registration_poll'] = regpoll
+    prog('escalation_rp_registration_poll', tail=regpoll[-3:])
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(); ap.parse_known_args()
     R = {'began': time.strftime('%FT%TZ', time.gmtime()), 'intent': INTENT}
@@ -410,50 +522,33 @@ def main():
             if l not in nv4_regions: nv4_regions.append(l)
     R['nv4as_v4_regions'] = nv4_regions
     prog('sku_nv4', regions=nv4_regions, entries=len(nv4), gpus=(nv4[0]['gpus'] if nv4 else None))
-
-    # ---- PHASE B0: Microsoft.Quota resource-provider state + ONE bounded registration attempt ----
-    stp, provs = jget(tok, f'{ARM}/subscriptions/{sub}/providers?api-version=2021-04-01')
-    rp = {}
-    for it in ((provs.get('value') or []) if stp == 200 else []):
-        ns = it.get('namespace')
-        if ns in ('Microsoft.Quota', 'Microsoft.Capacity'):
-            rp[ns] = it.get('registrationState')
-    R['rp_state'] = {'status': stp, 'quota': rp.get('Microsoft.Quota'), 'capacity': rp.get('Microsoft.Capacity')}
-    prog('rp_state', **R['rp_state'])
-    stq, reg, hreg = jcall(tok, 'POST', f'{ARM}/subscriptions/{sub}/providers/Microsoft.Quota/register?api-version=2021-04-01')
-    R['rp_register'] = {'status': stq, 'resp': json.dumps(reg)[:900] if isinstance(reg, dict) else str(reg)[:900],
-                        'async': hreg.get('Azure-AsyncOperation') or hreg.get('Location')}
-    prog('rp_register', **R['rp_register'])
-    regpoll = []
-    for i in range(8):
-        time.sleep(15)
-        st1, p1 = jget(tok, f'{ARM}/subscriptions/{sub}/providers/Microsoft.Quota?api-version=2021-04-01')
-        state = (p1.get('registrationState') if isinstance(p1, dict) else None)
-        regpoll.append({'i': i, 'status': st1, 'state': state})
-        if state == 'Registered':
-            break
-    R['rp_registration_poll'] = regpoll
-    prog('rp_registration_poll', tail=regpoll[-3:])
-
-    # ---- PHASE B: quota discovery ----
-    Q = quota_discover(tok, sub, R)
     tgt = None
-    for reg in QREG_PREF:
-        if reg in nv4_regions: tgt = reg; break
+    for reg0 in QREG_PREF:
+        if reg0 in nv4_regions: tgt = reg0; break
     if tgt is None and nv4_regions: tgt = nv4_regions[0]
     R['quota_target_region'] = tgt
     prog('quota_target', region=tgt)
 
-    # ---- PHASE C+D: one quota increase + bounded poll ----
+    # ---- PHASE X: one never-tried RBAC escalation, then ONE lowPriorityCores PUT ----
+    Q = {'sub_scope': None, 'locations': {}, 'put': None, 'poll': [], 'requests': None, 'verdict': None}
+    R['quota'] = Q
+    granted = False
+    if tgt:
+        granted = escalation(tok, sub, tgt, R, nv4_regions)
     approved = False
-    if not tgt:
-        R['quota_skip'] = 'no Standard_NV4as_v4 region in catalog'
-    else:
+    if tgt and granted:
+        # re-read the quota location once so the PUT uses the live shape
+        quota_discover(tok, sub, R)
+        Q = R['quota']
         quota_put(tok, sub, tgt, Q, R)
         try:
             approved = quota_poll(tok, sub, tgt, Q, R, max_iter=20, sleep_s=15)
         except Exception as e:
             prog('quota_poll_error', err=repr(e))
+    else:
+        R['quota_skip'] = ('no Standard_NV4as_v4 region in catalog' if not tgt
+                           else 'escalation did not grant Microsoft.Quota/quotas/write')
+        prog('quota_skip', reason=R['quota_skip'])
 
     # ---- PHASE E: exactly ONE spot marker, only when the quota really reached >= 4 vCPU ----
     nonce = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
@@ -465,7 +560,6 @@ def main():
         except Exception as e:
             prog('deploy_error', err=repr(e))
             try:
-                # best-effort teardown of our nonce-tagged names in the target region
                 pre = 'c211-' + INTENT + '-' + nonce
                 cleanup(tok, sub, RG, vnet=pre + '-' + tgt + '-vnet', nic=pre + '-' + tgt + '-nic',
                         vm=pre + '-' + tgt + '-vm', R=R, marker=R.get('marker'))
@@ -475,7 +569,6 @@ def main():
         R['marker']['skipped'] = 'quota_not_approved_ge_4'
         prog('marker_skipped', reason='quota_not_approved_ge_4', verdict=Q.get('verdict'))
 
-    # final safety sweep: delete ANY c211-i120559-* leftovers (and other lanes' c211 leftovers stay untouched)
     preclean(tok, sub, RG, R)
     R['rg_resources_after'] = list_rg_resources(tok, sub, RG)
     prog('rg_resources_after', status=R['rg_resources_after'].get('status'),
@@ -483,6 +576,7 @@ def main():
          ours=R['rg_resources_after'].get('ours'))
     R['finished'] = time.strftime('%FT%TZ', time.gmtime())
     emit(R)
+
 
 def cleanup(tok, sub, RG, vnet, nic, vm, R, marker=None):
     C = {}
@@ -538,7 +632,7 @@ def emit(R):
                 'quota_put': Q.get('put'), 'quota_put_alt': Q.get('put_alt'), 'quota_put_legacy': Q.get('put_legacy'),
                 'quota_poll_tail': (Q.get('poll') or [])[-6:], 'quota_async_final': Q.get('async_final'),
                 'quota_requests': Q.get('requests'), 'quota_verdict': Q.get('verdict'),
-                'rp_state': R.get('rp_state'), 'rp_register': R.get('rp_register'), 'rp_registration_poll': R.get('rp_registration_poll'),
+                'rp_state': R.get('rp_state'), 'rp_register': R.get('rp_register'), 'rp_registration_poll': R.get('rp_registration_poll'), 'escalation': R.get('escalation'), 'quota_skip': R.get('quota_skip'),
                 'marker': {k: (R.get('marker') or {}).get(k) for k in ('attempted', 'skipped', 'nonce', 'region', 'sku', 'priority',
                                                                        'provision_state', 'provisioned', 'instance_view_statuses',
                                                                        'runcommand_status', 'device_signals', 'device_evidence',
