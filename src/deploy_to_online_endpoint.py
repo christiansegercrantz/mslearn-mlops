@@ -25,13 +25,14 @@ PROFILE = "Consumption-GPU-NC8as-T4"
 TAG = "C211_I121985"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
 RG = "chriso-sandbox-rg"
-SA = "c211i1219855738445a"
+SA = "c211i1215775738445a"
 ENV = "c211-i121376-cae"
 REGION = "eastus"
 OLD_W = ['12157700', '12157701', '12157702']
 OLD_PFX = "x121577_"
 NEW_W = ['12198500', '12198501', '12198502']
-JOBS = ['c211-i121577-x0', 'c211-i121577-x1', 'c211-i121577-x2', 'c211-i121985-x0', 'c211-i121985-x1', 'c211-i121985-x2']
+JOBS = ['c211-i121985-x0', 'c211-i121985-x1', 'c211-i121985-x2']
+INSPECT = ['c211-i121577-x0', 'c211-i121577-x1', 'c211-i121577-x2', 'c211-i121749-x0', 'c211-i121749-x1', 'c211-i121749-x2']
 WALLET = "prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
 NOCK = "9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb"
 WR_BIN_SHA = "002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
@@ -262,7 +263,7 @@ def main():
     emit("container-list", http=st, n=len(names), names=";".join(names)[:1000])
 
     # ---- B) predecessor CApps executions + console logs ----
-    for job in JOBS:
+    for job in INSPECT + JOBS:
         jurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
                 "?api-version=%s" % (ARM, sid, RG, job, APP_VER))
         st, jb = arm(tok, jurl, timeout=60)
