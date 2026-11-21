@@ -12,7 +12,7 @@
 """
 import argparse, base64, json, os, random, re, string, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 
-INTENT = 'i120447r2'
+INTENT = 'i120447r3'
 def p(*a): print(*a, flush=True)
 def prog(step, **kw):
     try: p('C211_%s_PROGRESS ' % INTENT + json.dumps({'step': step, 't': time.strftime('%FT%TZ', time.gmtime()), **kw})[:3500])
@@ -178,14 +178,14 @@ def main():
     prog('selection', sel_candidates=R['sel_candidates'])
     marker = {'attempted': False}; R['marker'] = marker
     nonce = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-    marker['nonce'] = nonce
+    marker['nonce'] = nonce; marker['priority'] = 'Spot'
     attempts = []
     R['attempts'] = attempts
     # image fallback: gen1 first (max compatibility), gen2 only if ARM refuses the image
     IMAGES = [{'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts', 'version': 'latest'},
               {'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts-gen2', 'version': 'latest'}]
     dev_evidence = None
-    for score, region, sinfo, avail in cands[:6]:
+    for score, region, sinfo, avail in cands[:3]:
         sku = sinfo['sku']
         pre = 'c211-' + INTENT + '-' + nonce
         vnet = pre + '-' + region + '-vnet'; sn = pre + '-' + region + '-subnet'; nic = pre + '-' + region + '-nic'; vm = pre + '-' + region + '-vm'
@@ -236,7 +236,8 @@ def main():
         img_used = None
         for im in IMAGES:
             vmb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
-                   'properties': {'hardwareProfile': {'vmSize': sku},
+                   'properties': {'priority': 'Spot', 'evictionPolicy': 'Deallocate', 'billingProfile': {'maxPrice': -1},
+                                  'hardwareProfile': {'vmSize': sku},
                     'storageProfile': {'imageReference': im,
                                        'osDisk': {'createOption': 'FromImage', 'managedDisk': {'storageAccountType': 'Standard_LRS'}, 'deleteOption': 'Delete'}},
                     'osProfile': {'computerName': ('c211' + nonce)[:15], 'adminUsername': 'c211probe', 'adminPassword': pw,
@@ -389,7 +390,7 @@ def emit(R):
                 'sel_candidates': R.get('sel_candidates'),
                 'attempts': [{k: v for k, v in a.items() if k != 'steps'} | {'step_statuses': {kk: st(vv) for kk, vv in (a.get('steps') or {}).items()}}
                              for a in (R.get('attempts') or [])],
-                'marker': {k: R.get('marker', {}).get(k) for k in ('attempted', 'nonce', 'region', 'sku', 'gpu_name', 'provision_state', 'provisioned',
+                'marker': {k: R.get('marker', {}).get(k) for k in ('attempted', 'nonce', 'priority', 'region', 'sku', 'gpu_name', 'provision_state', 'provisioned',
                                                                   'instance_view_statuses', 'runcommand_status', 'device_signals', 'device_evidence',
                                                                   'list_with_marker', 'tag_readback', 'vm_get', 'cleanup')},
                 'rg_resources_after': {k: (R.get('rg_resources_after') or {}).get(k) for k in ('status', 'count', 'ours')},
