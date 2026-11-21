@@ -44,7 +44,7 @@ INTENT = 'i121283'
 ARM = 'https://management.azure.com'
 SUB = '790067ff-3e39-4632-ad1a-d65702d42c88'
 RG = 'chriso-sandbox-rg'
-SKU_ORDER = ['Standard_NV6', 'Standard_NV12', 'Standard_NC6s_v3', 'Standard_NC4as_T4_v3']
+SKU_ORDER = ['Standard_NC6s_v3']  # v2: the only SKU whose v1 attempt was invalidated by a region/NIC mismatch
 AUX = ['Standard_NV4as_v4', 'Standard_NV6s', 'Standard_NV6ads', 'Standard_NV12s_v3', 'Standard_NC6s']
 PREFIX = 'c211-i121283-'
 PROV_POLL = 30      # x10 s
@@ -159,6 +159,35 @@ def sku_entry(cat_value, name):
             'note': 'SKU absent from the subscription Microsoft.Compute/skus catalogue'}
 
 
+def sku_entries_agg(cat_value, name):
+    """Aggregate every catalogue entry for a SKU name (the catalogue is per-location)."""
+    ents = [s for s in (cat_value or []) if s.get('name') == name]
+    if not ents:
+        return {'present': False, 'name': name, 'restrictions': [], 'reasons': [],
+                'note': 'SKU absent from the subscription Microsoft.Compute/skus catalogue'}
+    e0 = ents[0]
+    caps = {c.get('name'): c.get('value') for c in (e0.get('capabilities') or [])}
+    locs, restr = [], []
+    for s in ents:
+        for l in (s.get('locations') or []):
+            l2 = l.lower().replace(' ', '')
+            if l2 not in locs:
+                locs.append(l2)
+        for r in (s.get('restrictions') or []):
+            restr.append(r)
+    seen, ded = set(), []
+    for r in restr:
+        k = json.dumps(r, sort_keys=True)
+        if k not in seen:
+            seen.add(k)
+            ded.append(r)
+    return {'present': True, 'name': name, 'family': e0.get('family'),
+            'vcpus': caps.get('vCPUs'), 'gpus': caps.get('GPUs'), 'gpu': caps.get('GPU'),
+            'memory_gb': caps.get('MemoryGB'), 'entries': len(ents),
+            'locations': locs, 'restrictions': ded,
+            'reasons': sorted({(r.get('reasonCode') or '') for r in ded})}
+
+
 def own_resources(tok, sub):
     st, rs, _ = jget(tok, '{0}/subscriptions/{1}/resourceGroups/{2}/resources?api-version=2021-04-01&$top=500'.format(ARM, sub, RG))
     if st != 200:
@@ -239,8 +268,8 @@ def main():
     sts, cat, catn = jget(tok, '{0}/subscriptions/{1}/providers/Microsoft.Compute/skus?api-version=2021-07-01'.format(ARM, sub), timeout=240)
     catv = (cat.get('value') or []) if sts == 200 else []
     R['sku_catalog'] = {'status': sts, 'bytes': catn, 'entries': len(catv)}
-    R['target_skus'] = {s: sku_entry(catv, s) for s in SKU_ORDER}
-    R['aux_skus'] = {s: sku_entry(catv, s) for s in AUX}
+    R['target_skus'] = {s: sku_entries_agg(catv, s) for s in SKU_ORDER}
+    R['aux_skus'] = {s: sku_entries_agg(catv, s) for s in AUX}
     gpu_all = [s.get('name') for s in catv if re.match(r'(?i)^Standard_(NC|ND|NV)', s.get('name') or '')]
     R['gpu_sku_names'] = sorted(gpu_all)
     p('C211_%s_SKU catalog=%s entries=%s gpu_skus=%s' % (INTENT, sts, len(catv), len(gpu_all)))
@@ -305,45 +334,53 @@ def main():
     pre['after'] = own_resources(tok, sub)
     R['preclean'] = pre
 
-    # ---- F. vnet + NIC ----
+    # ---- F. per-region vnet + NIC helper (NIC must live in the VM region) ----
     nonce = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-    vnet = PREFIX + nonce + '-vnet'
-    sn = PREFIX + nonce + '-subnet'
-    nic = PREFIX + nonce + '-nic'
     R['nonce'] = nonce
-    R['names'] = {'vnet': vnet, 'subnet': sn, 'nic': nic}
-    net = {}
-    vb = {'location': rgloc or 'eastus', 'tags': {'c211': INTENT, 'nonce': nonce},
-          'properties': {'addressSpace': {'addressPrefixes': ['10.213.0.0/16']},
-                         'subnets': [{'name': sn, 'properties': {'addressPrefix': '10.213.1.0/24'}}]}}
-    s1, r1, _ = jcall(tok, 'PUT', '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/virtualNetworks/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, vnet), vb)
-    net['vnet_create'] = {'status': s1, 'err': err_of(r1) if s1 not in (200, 201) else None}
-    p('C211_%s_NET vnet=%s status=%s' % (INTENT, vnet, s1))
-    nic_id = None
-    if s1 in (200, 201):
+    nets = {}
+    R['names'] = nets
+
+    def ensure_net(region):
+        if region in nets:
+            return nets[region].get('nic_id')
+        tag = PREFIX + nonce + '-' + region
+        vnet = tag + '-vnet'
+        sn = tag + '-subnet'
+        nic = tag + '-nic'
+        rec = {'region': region, 'vnet': vnet, 'subnet': sn, 'nic': nic, 'nic_id': None}
+        nets[region] = rec
+        vb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
+              'properties': {'addressSpace': {'addressPrefixes': ['10.213.0.0/16']},
+                             'subnets': [{'name': sn, 'properties': {'addressPrefix': '10.213.1.0/24'}}]}}
+        s1, r1, _ = jcall(tok, 'PUT', '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/virtualNetworks/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, vnet), vb)
+        rec['vnet_create'] = {'status': s1, 'err': err_of(r1) if s1 not in (200, 201) else None}
+        p('C211_%s_NET region=%s vnet=%s status=%s' % (INTENT, region, vnet, s1))
+        if s1 not in (200, 201):
+            return None
         for _ in range(30):
             stv, vs, _ = jget(tok, '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/virtualNetworks/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, vnet))
             props = (vs.get('properties') or {}) if stv == 200 else {}
             subs_states = [((x.get('properties') or {}).get('provisioningState')) for x in (props.get('subnets') or [])]
-            net['vnet_settle'] = {'status': stv, 'state': props.get('provisioningState'), 'subnets': subs_states}
+            rec['vnet_settle'] = {'status': stv, 'state': props.get('provisioningState'), 'subnets': subs_states}
             if stv == 200 and props.get('provisioningState') == 'Succeeded' and all(x == 'Succeeded' for x in subs_states):
                 break
             time.sleep(4)
         subnet_id = '/subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.Network/virtualNetworks/{2}/subnets/{3}'.format(sub, rgname, vnet, sn)
-        nb = {'location': rgloc or 'eastus', 'tags': {'c211': INTENT, 'nonce': nonce},
+        nb = {'location': region, 'tags': {'c211': INTENT, 'nonce': nonce},
               'properties': {'ipConfigurations': [{'name': 'ipcfg', 'properties': {
                   'privateIPAllocationMethod': 'Dynamic', 'subnet': {'id': subnet_id}}}]}}
         tries = []
+        s2 = r2 = None
         for _ in range(12):
             s2, r2, _ = jcall(tok, 'PUT', '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/networkInterfaces/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, nic), nb)
             tries.append({'status': s2, 'code': (err_of(r2) or {}).get('code') if s2 not in (200, 201) else None})
             if s2 in (200, 201):
-                nic_id = (r2 or {}).get('id')
+                rec['nic_id'] = (r2 or {}).get('id')
                 break
             time.sleep(8)
-        net['nic_create'] = {'status': s2, 'tries': tries, 'err': err_of(r2) if s2 not in (200, 201) else None}
-        p('C211_%s_NET nic=%s status=%s' % (INTENT, nic, s2))
-    R['network'] = net
+        rec['nic_create'] = {'status': s2, 'tries': tries, 'err': err_of(r2) if s2 not in (200, 201) else None}
+        p('C211_%s_NET region=%s nic=%s status=%s' % (INTENT, region, nic, s2))
+        return rec.get('nic_id')
 
     # ---- G. SKU attempts ----
     attempts = []
@@ -352,9 +389,6 @@ def main():
     R['device'] = device
     vm_created_names = []
     for sku in SKU_ORDER:
-        if not nic_id:
-            attempts.append({'sku': sku, 'skipped': 'no NIC (network create failed)'})
-            break
         ent = R['target_skus'][sku]
         region = rgloc or 'eastus'
         # prefer the RG region when the SKU is offered there; otherwise the first
@@ -371,6 +405,11 @@ def main():
                 cands = [l for l in (ent.get('locations') or []) if l not in restr]
                 if cands:
                     region = cands[0]
+        nic_id = ensure_net(region)
+        if not nic_id:
+            attempts.append({'sku': sku, 'region': region,
+                             'skipped': 'no NIC in region (network create failed)'})
+            continue
         vm = PREFIX + nonce + '-' + sku.replace('_', '').lower()
         vm_created_names.append(vm)
         att = {'sku': sku, 'region': region, 'priority': 'Regular', 'vm': vm,
@@ -524,15 +563,18 @@ def main():
                 att['teardown'] = delete_until_gone(tok, url, url)
                 p('C211_%s_VM_FAILED sku=%s state=%s teardown=%s' % (INTENT, sku, prov, json.dumps(att['teardown'])))
 
-    # ---- H. final teardown + absence ----
-    fin = {'vm': [], 'nic': None, 'vnet': None}
+    # ---- H. final teardown + absence (every own VM, NIC and vnet in every region) ----
+    fin = {'vms': [], 'nets': []}
     for vm in vm_created_names:
         url = '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Compute/virtualMachines/{3}?api-version=2024-07-01'.format(ARM, sub, rgname, vm)
-        fin['vm'].append({'name': vm, **delete_until_gone(tok, url, url)})
-    nurl = '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/networkInterfaces/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, nic)
-    fin['nic'] = {'name': nic, **delete_until_gone(tok, nurl, nurl)}
-    vurl = '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/virtualNetworks/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, vnet)
-    fin['vnet'] = {'name': vnet, **delete_until_gone(tok, vurl, vurl, tries=50, gap=5)}
+        fin['vms'].append({'name': vm, **delete_until_gone(tok, url, url)})
+    for region, rec in nets.items():
+        nurl = '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/networkInterfaces/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, rec['nic'])
+        d1 = delete_until_gone(tok, nurl, nurl)
+        vurl = '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Network/virtualNetworks/{3}?api-version=2024-01-01'.format(ARM, sub, rgname, rec['vnet'])
+        d2 = delete_until_gone(tok, vurl, vurl, tries=50, gap=5)
+        fin['nets'].append({'region': region, 'nic': {'name': rec['nic'], **d1},
+                            'vnet': {'name': rec['vnet'], **d2}})
     fin['resources_after'] = own_resources(tok, sub)
     R['final_teardown'] = fin
     p('C211_%s_FINAL left=%s' % (INTENT, json.dumps((fin.get('resources_after') or {}).get('ours'))))
