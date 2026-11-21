@@ -332,7 +332,7 @@ def main():
             emit({"step": "storage-create", "location": loc, "acct": acct, "http": st,
                   "state": (b.get("properties") or {}).get("provisioningState")
                   if isinstance(b, dict) else None, **({} if st in (200, 201) else err_of(st, b))})
-            if st in (200, 201):
+            if st in (200, 201, 202):
                 created = True
                 break
         R["created"] = created
