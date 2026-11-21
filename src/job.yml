@@ -1,20 +1,25 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+type: command
 code: .
 command: >-
-  python train-model-parameters.py
-  --training_data ${{inputs.training_data}}
-  --reg_rate ${{inputs.reg_rate}}
-  --metrics_output ${{outputs.metrics_output}}
+  echo C211_I120729_DEV_START;
+  (nvidia-smi -L || echo NO_NVIDIA_SMI);
+  (nvidia-smi --query-gpu=name,uuid,memory.total --format=csv || true);
+  (ls -l /dev/nvidia* 2>/dev/null || echo NO_DEV_NVIDIA);
+  (for v in /sys/bus/pci/devices/*/vendor; do echo PCI $v `cat $v`; done | grep -Ei '10de|1002' || echo NO_GPU_PCI);
+  uname -a;
+  echo C211_I120729_DEV_END
 inputs:
   training_data:
-      type: uri_file
-      path: azureml:diabetes-data@latest
-  reg_rate: 0.01
+    type: uri_folder
+    path: azureml:diabetes-prod-folder@latest
+    mode: direct
 outputs:
   metrics_output:
     type: uri_folder
-environment: azureml:AzureML-sklearn-1.0-ubuntu20.04-py38-cpu@latest
-compute: azureml:aml-cluster
-experiment_name: diabetes-training
-display_name: diabetes-train-command
-description: diabetes training job
+environment:
+  image: mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest
+compute: azureml:c211-i120729-n7k4q
+experiment_name: c211-i120729
+display_name: c211-i120729-gpuprobe
+description: c211 i120729 bounded GPU device probe on the nonce AmlCompute cluster
