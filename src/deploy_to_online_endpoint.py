@@ -561,6 +561,7 @@ def main():
     # ---------- D) poll ----------
     blobd_a = blobd_t = ""
     stopped = set()
+    seen = set()
     deadline = time.time() + BUDGET
     while time.time() < deadline:
         time.sleep(20)
@@ -592,19 +593,39 @@ def main():
         def st_of(blob):
             d = {}
             for ln in blob.splitlines():
-                if ln.startswith(("host=", "worker=", "mode=", "uuid=", "acc=", "rej=")):
+                if ln.startswith("acc="):
+                    parts = ln.split()
+                    d["acc"] = parts[0].split("=", 1)[-1]
+                    for p in parts[1:]:
+                        if p.startswith("rej="):
+                            d["rej"] = p.split("=", 1)[-1]
+                    continue
+                if ln.startswith(("host=", "worker=", "mode=", "uuid=", "rej=")):
                     k, _, v = ln.partition("=")
                     d[k] = v
             return d
         sa = st_of(blobd_a)
         stt = st_of(blobd_t)
+        if blobd_a and "a" not in seen:
+            seen.add("a")
+            emit("blob-raw-a", b64=base64.b64encode(blobd_a[:4000].encode()).decode()[:5400])
+        if blobd_t and "t" not in seen:
+            seen.add("t")
+            emit("blob-raw-t", b64=base64.b64encode(blobd_t[:4000].encode()).decode()[:5400])
         emit("poll", a100_exec=exec_a, a100_mode=sa.get("mode"), a100_acc=sa.get("acc"),
-             a100_rej=sa.get("rej"), a100_worker=sa.get("worker"), a100_len=len(blobd_a),
+             a100_rej=sa.get("rej"), a100_worker=sa.get("worker"), a100_host=sa.get("host"),
+             a100_uuid=(sa.get("uuid") or "")[:80], a100_len=len(blobd_a),
              t4_exec=exec_t, t4_mode=stt.get("mode"), t4_acc=stt.get("acc"), t4_worker=stt.get("worker"),
-             t4_len=len(blobd_t), left=int(deadline - time.time()))
+             t4_host=stt.get("host"), t4_uuid=(stt.get("uuid") or "")[:80], t4_len=len(blobd_t),
+             left=int(deadline - time.time()))
         proven = ("PH_SHARE_PROVEN" in blobd_a) or ("LP_SHARE_PROVEN" in blobd_a) or \
                  ("PH_SHARE_PROVEN" in blobd_t) or ("LP_SHARE_PROVEN" in blobd_t)
-        accs = [int(sa.get("acc") or 0), int(stt.get("acc") or 0)]
+        def _i(x):
+            try:
+                return int(str(x).strip().split()[0])
+            except Exception:  # noqa: BLE001
+                return 0
+        accs = [_i(sa.get("acc")), _i(stt.get("acc"))]
         if proven or max(accs) > 0:
             emit("share-proven-early", a100_tail_b64=base64.b64encode(blobd_a[-2500:].encode()).decode()[:3000],
                  t4_tail_b64=base64.b64encode(blobd_t[-2500:].encode()).decode()[:3000])
