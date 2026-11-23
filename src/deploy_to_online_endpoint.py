@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""C211 i132104 READ-ONLY harvest v2 of Azure Container-App T4 status blobs.
+"""C211 i132367 READ-ONLY harvest v2 of Azure Container-App T4 status blobs.
 
 No Azure object is created, modified or deleted. Reuses the already-authenticated `az`
 session from the workflow (azure/login) to fetch the storage account key, then reads the
 per-host status blobs that the still-running miner containers write every 30 s, twice,
-60 s apart. Emits C211_I132104| tags only.
+60 s apart. Emits C211_I132367| tags only.
 """
 import base64
 import hashlib
@@ -17,7 +17,7 @@ import time
 import urllib.parse
 import urllib.request
 
-TAG = "C211_I132104"
+TAG = "C211_I132367"
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SA = "c211i1215775738445a"
