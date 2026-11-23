@@ -29,7 +29,7 @@ ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 PREFIX = "c211-i132904"
 TAG = "C211_I132904"
-NONCE = "x132904f1baa7"
+NONCE = "x132904w3b1df7"
 DEADLINE = 4200
 KEEP_ALIVE = True
 T0 = time.time()
@@ -325,7 +325,7 @@ def main():
         ep = e.get("properties") or {}
         profs = [(p.get("name"), p.get("workloadProfileType"))
                  for p in (ep.get("workloadProfiles") or []) if p.get("workloadProfileType")]
-        rows.append({"name": e.get("name"), "loc": (e.get("location") or "").lower(),
+        rows.append({"name": e.get("name"), "loc": (e.get("location") or "").lower().replace(" ",""),
                      "state": ep.get("provisioningState"), "id": e.get("id"), "profs": profs})
     emit("env-list", http=st, n=len(rows),
          matrix=";".join("%s:%s:%s:%s" % (r["name"], r["loc"], r["state"],
