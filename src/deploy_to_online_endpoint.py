@@ -20,7 +20,7 @@ import urllib.request
 TAG = "C211_I133224"
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
-SA = "c211i1215775738445a"
+SA = "c211i1332240107a52"
 CONTS = ["c211-i133224"]
 STG_VER = "2023-01-01"
 PREFIXES = ["x133224t4e-t4-"]
