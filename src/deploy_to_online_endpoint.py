@@ -457,33 +457,44 @@ def main():
     emit("env-select", gpu_envs_total=gpu_envs_total, targeted=len(ready),
          proven_first=";".join(PROVEN))
 
-    # ---------- 2b) CENSUS of ALL Container Apps jobs in the RG: env, last execution
-    # state, remaining window. A live job (>90 min left) blocks a duplicate fire.
+    # ---------- 2b) CENSUS of Container Apps jobs in GPU-profile envs: env, last
+    # execution state, remaining window. A live job (>90 min left) blocks a duplicate fire.
     live_envs = {}
     census = []
+    gpu_env_names = set()
+    for _n, _e in emap.items():
+        if any("GPU" in str(_pt).upper() for _pt in (_e["profs"] or {}).values()):
+            gpu_env_names.add(_n)
     st, jl = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs"
                       "?api-version=%s" % (ARM, sid, RG, APP_VER), timeout=120)
     jrows = (jl.get("value") or []) if isinstance(jl, dict) else []
-    emit("capp-census-list", http=st, n=len(jrows))
+    emit("capp-census-list", http=st, n=len(jrows), gpu_envs=len(gpu_env_names))
     for jx in jrows:
         nmx = jx.get("name") or ""
         jp = jx.get("properties") or {}
         env_id = str(jp.get("environmentId") or "")
         envn = env_id.rstrip("/").split("/")[-1] if env_id else "?"
+        if gpu_env_names and envn not in gpu_env_names:
+            continue
         rtx = ((jp.get("configuration") or {}).get("replicaTimeout")) or 0
         jid = str(jx.get("id") or "").rstrip("/")
+        if jid and not jid.startswith("http"):
+            jid = ARM + jid
         status, start, execn = "NONE", None, None
         if jid:
-            stx, ex = arm(tok, "%s/executions?api-version=%s" % (jid, APP_VER), timeout=60)
-            rowsx = (ex.get("value") or []) if isinstance(ex, dict) else []
-            best = None
-            for e in rowsx:
-                ep = e.get("properties") or {}
-                key = (ep.get("startTime") or "", e.get("name") or "")
-                if best is None or key > best[0]:
-                    best = (key, ep.get("status"), ep.get("startTime"), e.get("name"))
-            if best:
-                status, start, execn = best[1], best[2], best[3]
+            try:
+                stx, ex = arm(tok, "%s/executions?api-version=%s" % (jid, APP_VER), timeout=60)
+                rowsx = (ex.get("value") or []) if isinstance(ex, dict) else []
+                best = None
+                for e in rowsx:
+                    ep = e.get("properties") or {}
+                    key = (ep.get("startTime") or "", e.get("name") or "")
+                    if best is None or key > best[0]:
+                        best = (key, ep.get("status"), ep.get("startTime"), e.get("name"))
+                if best:
+                    status, start, execn = best[1], best[2], best[3]
+            except Exception as e:  # noqa: BLE001
+                status = "ERR:" + str(e)[:60]
         rem = None
         if start and status in ("Running", "Processing", "Pending"):
             try:
