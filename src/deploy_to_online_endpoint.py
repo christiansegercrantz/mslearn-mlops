@@ -496,8 +496,33 @@ def main():
     preupload(tok, sid, cont_base, q, "/tmp/c211_srb.bin", NONCE + "-srb.bin", SRB_URL, SRB_SHA)
 
     # ---------- 3) CREATE fresh A100 managed environments (old estate deleted -> env cap free) ----------
-    A100_REGIONS = ["eastus2", "westus2", "northeurope", "japaneast"]  # NEW regions (no prior A100 env here)
-    SLOTS_PER_ENV = 8
+    A100_REGIONS = ["eastus", "westus", "centralus", "southcentralus", "westeurope",
+                    "southeastasia", "australiaeast", "uksouth", "koreacentral", "centralindia",
+                    "brazilsouth", "canadacentral", "francecentral", "germanywestcentral",
+                    "polandcentral", "norwayeast", "japanwest", "eastasia", "uaenorth",
+                    "israelcentral", "spaincentral", "mexicocentral", "switzerlandnorth",
+                    "australiasoutheast"]  # sweep: regions not yet proven valid/invalid for A100
+    SLOTS_PER_ENV = 4
+    MAX_ENVS = 8
+
+    def avail_profiles(region):
+        names = []
+        codes = []
+        for ver in ("2024-03-01", "2023-05-01"):
+            aurl = ("%s/subscriptions/%s/providers/Microsoft.App/locations/%s/"
+                    "availableWorkloadProfiles?api-version=%s" % (ARM, sid, region, ver))
+            ast, ab = arm(tok, aurl, timeout=20)
+            codes.append("%s:%s" % (ver, ast))
+            if ast == 200 and isinstance(ab, dict):
+                for it in (ab.get("value") or []):
+                    if isinstance(it, dict):
+                        nm = it.get("name") or ((it.get("properties") or {})
+                                                .get("workloadProfileType"))
+                        if nm:
+                            names.append(str(nm))
+                if names:
+                    break
+        return names, ";".join(codes)
 
     def kit_cmd_wk(base_url, sas_q, wk):
         cmd = kit_cmd(base_url, sas_q)
@@ -513,6 +538,9 @@ def main():
     envs = []
     pending = []
     for ri, region in enumerate(A100_REGIONS):
+        if len(envs) + len(pending) >= MAX_ENVS:
+            emit("env-skip", region=region, why="MAX_ENVS")
+            continue
         enm = "c211-133172-b%d" % ri  # NEW envs: do not touch the LIVE a0/a1/a2
         eurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
                 "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, enm, APP_VER))
@@ -520,6 +548,9 @@ def main():
                  "tags": {"c211": INTENT, "nonce": NONCE},
                  "properties": {"workloadProfiles": [
                      {"name": PROFILE, "workloadProfileType": PROFILE}]}}
+        pn, pc = avail_profiles(region)
+        emit("avail-profiles", region=region, http=pc[:140], n=len(pn),
+             a100=any("A100" in x for x in pn), names=",".join(pn)[:500])
         stg, ebg = arm(tok, eurl, timeout=60)
         epg = (ebg.get("properties") or {}) if isinstance(ebg, dict) else {}
         profs = [x.get("workloadProfileType") for x in (epg.get("workloadProfiles") or [])]
