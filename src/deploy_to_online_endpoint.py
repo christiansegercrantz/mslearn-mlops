@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""C211 i132104 READ-ONLY harvest of Azure Container-App T4 status blobs.
+"""C211 i132104 READ-ONLY harvest v2 of Azure Container-App T4 status blobs.
 
-No Azure object is created, modified or deleted. It reuses the already-authenticated
-`az` session from the workflow (azure/login) to fetch the storage account key, then
-reads the per-host status blobs that the still-running miner containers write every
-30 s, twice, 60 s apart. Emits C211_I132104| tags only.
+No Azure object is created, modified or deleted. Reuses the already-authenticated `az`
+session from the workflow (azure/login) to fetch the storage account key, then reads the
+per-host status blobs that the still-running miner containers write every 30 s, twice,
+60 s apart. Emits C211_I132104| tags only.
 """
 import base64
 import hashlib
 import hmac
 import json
+import re
 import subprocess
 import sys
 import time
@@ -20,7 +21,7 @@ TAG = "C211_I132104"
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SA = "c211i1215775738445a"
-CONT = "c211-i131909c"
+CONTS = ["c211-i131909c", "c211-i131909b"]
 STG_VER = "2023-01-01"
 PREFIXES = ["x131909t4c-t4-", "x131909t4b-t4-"]
 GAP_S = 60
@@ -68,7 +69,6 @@ def blob_list(cont_url, q, prefix):
                            % (cont_url, urllib.parse.quote(prefix), q), timeout=60)
     names = []
     if st == 200:
-        import re
         names = re.findall(r"<Name>([^<]+)</Name>", body.decode("utf-8", "replace"))
     return st, names
 
@@ -79,7 +79,6 @@ def blob_get(cont_url, q, name):
 
 def parse_status(txt):
     """Parse the ===STATUS=== header block written by the container kit."""
-    import re
     out = {}
     start = txt.find("===STATUS===")
     if start < 0:
@@ -89,9 +88,15 @@ def parse_status(txt):
         m = re.search(r"^%s=(.*)$" % k, blk, re.M)
         if m:
             out[k] = m.group(1).strip()
-    m = re.search(r"^acc=(\d+) rej=(\d+) last_accept_epoch=(\d+) uptime_s=(\d+)", blk, re.M)
+    m = re.search(r"^acc=(\d+)\s+rej=(\d+)\s+last_accept_epoch=(\d+)\s+uptime_s=(\d+)",
+                  blk, re.M)
+    if not m:
+        m = re.search(r"^acc=(\d+).*?rej=(\d+)", blk, re.M)
     if m:
-        out["acc"], out["rej"], out["lae"], out["up"] = m.groups()
+        g = m.groups()
+        out["acc"], out["rej"] = g[0], g[1]
+        if len(g) >= 4:
+            out["lae"], out["up"] = g[2], g[3]
     return out
 
 
@@ -118,7 +123,6 @@ def main():
     st, body, _ = httptext(url, method="POST", data=b"{}",
                            headers={"Authorization": "Bearer " + tok,
                                     "Content-Type": "application/json"}, timeout=90)
-    key = None
     try:
         key = json.loads(body)["keys"][0]["value"]
     except Exception:  # noqa: BLE001
@@ -127,30 +131,32 @@ def main():
     emit("keys", http=st, key_present=bool(key))
 
     q = acct_sas(SA, key, hours=1, perm="rl")
-    cont = "https://%s.blob.core.windows.net/%s" % (SA, CONT)
     for rnd in (1, 2):
-        for p in PREFIXES:
-            st, names = blob_list(cont, q, p)
-            emit("list", r=rnd, prefix=p, http=st, n=len(names),
-                 names=",".join(names[:8]))
-            for n in names[:4]:
-                st, body = blob_get(cont, q, n)
-                txt = body.decode("utf-8", "replace")
-                hdr = parse_status(txt)
-                ph_tail = ""
-                if "===PHLOG===" in txt:
-                    ph = txt.split("===PHLOG===", 1)[1]
-                    ph = ph.split("===LPLOG===", 1)[0]
-                    acc_lines = [x for x in ph.splitlines() if "accepted" in x.lower()]
-                    ph_tail = " / ".join(acc_lines[-2:])
-                emit("status", r=rnd, name=n, http=st, bytes=len(body),
-                     host=hdr.get("host"), worker=hdr.get("worker"), mode=hdr.get("mode"),
-                     ts=hdr.get("ts"), uuid=hdr.get("uuid"), acc=hdr.get("acc"),
-                     rej=hdr.get("rej"), lae=hdr.get("last_accept_epoch"),
-                     up=hdr.get("uptime_s"), ph=ph_tail[:500])
+        for cname in CONTS:
+            cont = "https://%s.blob.core.windows.net/%s" % (SA, cname)
+            for p in PREFIXES:
+                st, names = blob_list(cont, q, p)
+                emit("list", r=rnd, cont=cname, prefix=p, http=st, n=len(names),
+                     names=",".join(names[:8]))
+                for n in names[:4]:
+                    st, body = blob_get(cont, q, n)
+                    txt = body.decode("utf-8", "replace")
+                    hdr = parse_status(txt)
+                    ph_tail = ""
+                    if "===PHLOG===" in txt:
+                        ph = txt.split("===PHLOG===", 1)[1]
+                        ph = ph.split("===LPLOG===", 1)[0]
+                        acc_lines = [x for x in ph.splitlines() if "accept" in x.lower()]
+                        ph_tail = " / ".join(acc_lines[-3:])
+                    raw = " ~ ".join(txt.split("===KITLOG===", 1)[0].splitlines()[:14])
+                    emit("status", r=rnd, cont=cname, name=n, http=st, bytes=len(body),
+                         host=hdr.get("host"), worker=hdr.get("worker"),
+                         mode=hdr.get("mode"), ts=hdr.get("ts"), uuid=hdr.get("uuid"),
+                         acc=hdr.get("acc"), rej=hdr.get("rej"), lae=hdr.get("lae"),
+                         up=hdr.get("up"), ph=ph_tail[:700], hdr=raw[:700])
         if rnd == 1:
             time.sleep(GAP_S)
-    emit("DONE", phase="harvest", elapsed_s=int(time.time() - t0), writes=0)
+    emit("DONE", phase="harvest2", elapsed_s=int(time.time() - t0), writes=0)
     return 0
 
 
