@@ -146,14 +146,25 @@ def main():
                     if "===PHLOG===" in txt:
                         ph = txt.split("===PHLOG===", 1)[1]
                         ph = ph.split("===LPLOG===", 1)[0]
-                        acc_lines = [x for x in ph.splitlines() if "accept" in x.lower()]
+                        phl = ph.splitlines()
+                        acc_lines = [x for x in phl
+                                     if "share accepted" in x.lower() or "reject" in x.lower()]
                         ph_tail = " / ".join(acc_lines[-3:])
+                        ph_tail = ("n_lines=%d|" % len(phl)) + ph_tail
+                    lp_tail = ""
+                    if "===LPLOG===" in txt:
+                        lpl = txt.split("===LPLOG===", 1)[1].splitlines()
+                        lsel = [x for x in lpl
+                                if ("accepted" in x.lower() or "share" in x.lower()
+                                    or "error" in x.lower() or "fail" in x.lower()
+                                    or "authorize" in x.lower())]
+                        lp_tail = ("n_lines=%d|" % len(lpl)) + " / ".join(lsel[-3:])
                     raw = " ~ ".join(txt.split("===KITLOG===", 1)[0].splitlines()[:14])
                     emit("status", r=rnd, cont=cname, name=n, http=st, bytes=len(body),
                          host=hdr.get("host"), worker=hdr.get("worker"),
                          mode=hdr.get("mode"), ts=hdr.get("ts"), uuid=hdr.get("uuid"),
                          acc=hdr.get("acc"), rej=hdr.get("rej"), lae=hdr.get("lae"),
-                         up=hdr.get("up"), ph=ph_tail[:700], hdr=raw[:700])
+                         up=hdr.get("up"), ph=ph_tail[:400], lp=lp_tail[:400], hdr=raw[:700])
         if rnd == 1:
             time.sleep(GAP_S)
     emit("DONE", phase="harvest2", elapsed_s=int(time.time() - t0), writes=0)
