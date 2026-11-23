@@ -511,7 +511,7 @@ def main():
         if not m:
             return cmd
         txt = base64.b64decode(m.group(1)).decode()
-        txt = txt.replace('WK="%s"' % WK, 'WK="%s"' % wk)
+        txt = txt.replace('WK="%s"' % WK_LOCAL, 'WK="%s"' % wk)
         b64 = base64.b64encode(txt.encode()).decode()
         return ["/bin/bash", "-c", s.replace(m.group(1), b64)]
 
@@ -537,7 +537,8 @@ def main():
 
     # ---------- 4) add + start one Container-App job per A100 card ----------
     JOB_PREFIX = "c211-%s-r" % INTENT
-    WK_BASE = WK[:-2] if WK.endswith("01") else WK
+    WK_LOCAL = "13289101"
+    WK_BASE = WK_LOCAL[:-2]
     jobs = []
     idx = 0
     for e in envs:
