@@ -25,6 +25,7 @@ SA_FALLBACK = ["c211i1215775738445a", "c211i133055reusea12f8a2"]
 CONTS = ["c211-i133055-reuse"]
 STG_VER = "2023-01-01"
 PREFIXES = ["x133172b-t4-"]
+ROUND = 2  # refresh harvest for pair-B settlement
 GAP_S = 60
 
 
