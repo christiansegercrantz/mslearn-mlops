@@ -29,8 +29,8 @@ ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
 TAG = "C211_I133534"
-INTENT = "133534"
-NONCE = "x133534quota"
+INTENT = "133686"
+NONCE = "x133686pool"
 T0 = time.time()
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
@@ -294,7 +294,7 @@ def decode_status(txt):
 
 PROVEN = ["c211-133172-b0", "c211-i132971-a100-sweden", "c211-132160-brs"]
 COMPUTE_VER = "2024-07-01"
-MAX_ENVS = 14
+MAX_ENVS = 4
 GPU_REGIONS = ["eastus", "eastus2", "westus", "westus2", "westus3", "centralus",
                "northcentralus", "southcentralus", "canadacentral", "brazilsouth",
                "swedencentral", "westeurope", "northeurope", "uksouth", "francecentral",
