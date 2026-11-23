@@ -17,7 +17,7 @@ import time
 import urllib.parse
 import urllib.request
 
-TAG = "C211_I132741"
+TAG = "C211_I132897"
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SA = "c211i1215775738445a"
