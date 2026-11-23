@@ -315,65 +315,44 @@ def main():
             except Exception as e:  # noqa: BLE001
                 emit("sa-sas", ok=False, err=str(e))
 
-    # ---------- 4) one fresh T4 environment, bounded region list ----------
+    # ---------- 4) reuse an EXISTING GPU-profile managed environment (50-env subscription cap) ----------
+    envurls_list = (f"{ARM}/subscriptions/{sid}/providers/Microsoft.App/"
+                    f"managedEnvironments?api-version={APP_VER}")
+    st, le = arm(tok, envurls_list, timeout=120)
+    envs = (le.get("value") or []) if isinstance(le, dict) else []
+    rows = []
+    for e in envs:
+        ep = e.get("properties") or {}
+        profs = [(p.get("name"), p.get("workloadProfileType"))
+                 for p in (ep.get("workloadProfiles") or []) if p.get("workloadProfileType")]
+        rows.append({"name": e.get("name"), "loc": (e.get("location") or "").lower(),
+                     "state": ep.get("provisioningState"), "id": e.get("id"), "profs": profs})
+    emit("env-list", http=st, n=len(rows),
+         matrix=";".join("%s:%s:%s:%s" % (r["name"], r["loc"], r["state"],
+                                          ",".join(str(p[1]) for p in r["profs"]))
+                         for r in rows)[:4000])
+
+    def pick(pref_loc, tag):
+        hit = [r for r in rows if r["state"] == "Succeeded" and r["id"]
+               and any(tag.upper() in str(p[1]).upper() for p in r["profs"])]
+        return ([r for r in hit if r["loc"] == pref_loc] or hit or [None])[0]
+
     chosen = None
-    attempts = []
-    envbody_base = {"tags": {"c211": "i132904", "nonce": NONCE},
-                    "properties": {"workloadProfiles": [
-                        {"name": "Consumption", "workloadProfileType": "Consumption"},
-                        {"name": PROFILE, "workloadProfileType": PROFILE}]}}
-    for region in cand:
-        if left() < 1800:
-            emit('region-budget-exhausted', region=region, left=int(left()))
-            break
-        ab = ABBREV.get(region, re.sub(r'[^a-z0-9]', '', region)[:6])
-        envname = ("c211-i132904-%s" % ab)[:32]
-        envurl = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.App/"
-                  f"managedEnvironments/{envname}?api-version={APP_VER}")
-        body = dict(envbody_base)
-        body['location'] = region
-        st, b = arm(tok, envurl, method="PUT", body=body, timeout=300)
-        rec = {"region": region, "name": envname, **err_of(st, b)}
-        attempts.append(rec)
-        emit("env-create", **rec)
-        if st not in (200, 201):
-            stg, _ = arm(tok, envurl, timeout=60)
-            if stg == 200:
-                d, db = arm(tok, envurl, method="DELETE", timeout=240)
-                emit("env-cleanup-delete", region=region, **err_of(d, db))
-                emit("env-cleanup-absent", region=region,
-                     http=wait_gone(tok, envurl, "env", tries=12, sleep_s=8))
-            continue
-        dl = time.time() + min(1500, max(420, left() - 1500))
-        ps = None
-        i = 0
-        while time.time() < dl:
-            stp, bp = arm(tok, envurl, timeout=60)
-            ps = ((bp.get("properties") or {}) if isinstance(bp, dict) else {}).get("provisioningState")
-            emit("env-poll", region=region, i=i, http=stp, state=ps)
-            if ps in ("Succeeded", "Failed", "Canceled"):
-                break
-            i += 1
-            time.sleep(25)
-        emit("env-result", region=region, state=ps, poll_n=i + 1)
-        if ps == "Succeeded":
-            chosen = {"region": region, "name": envname, "url": envurl}
-            break
-        d, db = arm(tok, envurl, method="DELETE", timeout=240)
-        emit("env-failed-delete", region=region, **err_of(d, db))
-        emit("env-failed-absent", region=region, http=wait_gone(tok, envurl, "env",
-                                                                tries=16, sleep_s=10))
-    emit('env-attempts', n=len(attempts),
-         matrix=';'.join('%s:%s:%s' % (a['region'], a.get('http'), a.get('code') or '')
-                         for a in attempts))
-    if not chosen:
+    sel = pick("westus3", "T4") or pick("westus3", "A100")
+    if sel:
+        profmatch = [p for p in sel["profs"] if "T4" in str(p[1]).upper()] or sel["profs"]
+        prof = [p for p in profmatch if str(p[1]).upper().startswith("CONSUMPTION")] or profmatch
+        chosen = {"name": sel["name"], "region": sel["loc"], "profile": prof[0][0],
+                  "url": ARM + sel["id"] + "?api-version=" + APP_VER}
+        emit("env-reuse", ok=True, name=sel["name"], region=sel["loc"],
+             profile=prof[0][0], profile_type=prof[0][1], state=sel["state"])
+    if chosen is None:
+        emit("env-reuse", ok=False, verdict="NO_EXISTING_GPU_ENV")
         if sas is not None:
             d, db = arm(tok, saurl, method="DELETE", timeout=240)
             emit("sa-delete", name=SA_NAME, **err_of(d, db))
             emit("sa-absent", http=wait_gone(tok, saurl, "sa", tries=20, sleep_s=8))
-        report_absence(tok, sid)
-        emit("DONE", phase="capp", verdict="ENV_REFUSED_ALL_REGIONS",
-             attempts_n=len(attempts), elapsed_s=int(time.time() - T0))
+        emit("DONE", phase="capp", verdict="NO_ENV_AVAILABLE", elapsed_s=int(time.time() - T0))
         return
 
     # ---------- 5) ONE nonce job execution ----------
@@ -414,7 +393,7 @@ def main():
     joburl = (f"{ARM}/subscriptions/{sid}/resourceGroups/{RG}/providers/Microsoft.App/jobs/"
               f"{jobname}?api-version={APP_VER}")
     jobbody = {"location": region, "tags": {"c211": "i132904", "nonce": NONCE},
-               "properties": {"environmentId": env_id, "workloadProfileName": PROFILE,
+               "properties": {"environmentId": env_id, "workloadProfileName": chosen.get("profile"),
                               "configuration": {"triggerType": "Manual",
                                                 "replicaRetryLimit": 0,
                                                 "replicaTimeout": 1800,
@@ -510,7 +489,7 @@ def main():
                                  for v in vv[:5]))
     # ---------- 6) teardown (deferred: KEEP_ALIVE leaves env/job for independent readback) ----------
     if KEEP_ALIVE:
-        emit("KEEP", env=chosen['name'], env_region=region, job=jobname,
+        emit("KEEP", env=chosen['name'], env_region=region, job=jobname, env_reused="True",
              exec_name=str(execname), sas_url=str(sas or ''),
              capture_len=len(text or ''))
         emit("DONE", phase="keep", elapsed_s=int(time.time() - T0), region=region,
