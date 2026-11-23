@@ -565,8 +565,8 @@ def main():
          matrix=";".join("%s:%s:%s" % (e["name"], e["region"], e["slots"]) for e in envs))
 
     # ---------- 4) add + start one Container-App job per A100 card ----------
-    JOB_PREFIX = "c211-%s-r" % INTENT
-    WK_LOCAL = "13305501"
+    JOB_PREFIX = "c211-133088-r"
+    WK_LOCAL = "13308801"
     WK_BASE = WK_LOCAL[:-2]
     jobs = []
     idx = 0
