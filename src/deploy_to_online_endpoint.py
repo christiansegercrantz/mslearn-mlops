@@ -520,13 +520,25 @@ def main():
                  "tags": {"c211": INTENT, "nonce": NONCE},
                  "properties": {"workloadProfiles": [
                      {"name": PROFILE, "workloadProfileType": PROFILE}]}}
+        stg, ebg = arm(tok, eurl, timeout=60)
+        epg = (ebg.get("properties") or {}) if isinstance(ebg, dict) else {}
+        profs = [x.get("workloadProfileType") for x in (epg.get("workloadProfiles") or [])]
+        state_g = epg.get("provisioningState")
+        emit("env-get", name=enm, region=region, http=stg, state=state_g,
+             has_profile=any(x == PROFILE for x in profs))
+        if stg == 200 and any(x == PROFILE for x in profs):
+            pending.append({"name": enm, "region": region, "url": eurl, "slots": SLOTS_PER_ENV})
+            continue
         st, eb = arm(tok, eurl, method="PUT", body=ebody, timeout=180)
-        emit("env-put", name=enm, region=region, http=st,
-             **({} if st in (200, 201) else errk(st, eb)))
         if st in (200, 201):
+            emit("env-put", name=enm, region=region, http=st)
             pending.append({"name": enm, "region": region, "url": eurl, "slots": SLOTS_PER_ENV})
         else:
-            code = str(((eb.get("error") or {}) if isinstance(eb, dict) else {}).get("code") or "")
+            ek = errk(st, eb)
+            emit("env-put", name=enm, region=region, http=st,
+                 code=(ek.get("code") or ek.get("raw") or "")[:160],
+                 msg=(ek.get("message") or "")[:220])
+            code = str(ek.get("code") or "")
             if st == 409 and ("AlreadyExists" in code or "Conflict" in code):
                 pending.append({"name": enm, "region": region, "url": eurl, "slots": SLOTS_PER_ENV})
     for i in range(45):
@@ -581,15 +593,25 @@ def main():
                                       "command": kit_cmd_wk(base + "/" + cont_use, q, jb["wk"]),
                                       "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
         st, b = arm(tok, jurl, method="PUT", body=jobbody, timeout=180)
-        emit("job-put", name=jb["name"], env=jb["env"]["name"], wk=jb["wk"], http=st,
-             **({} if st in (200, 201) else errk(st, b)))
+        if st in (200, 201):
+            emit("job-put", name=jb["name"], env=jb["env"]["name"], wk=jb["wk"], http=st)
+        else:
+            ek = errk(st, b)
+            emit("job-put", name=jb["name"], env=jb["env"]["name"], wk=jb["wk"], http=st,
+                 code=(ek.get("code") or ek.get("raw") or "")[:160],
+                 msg=(ek.get("message") or "")[:220])
         if st not in (200, 201):
             continue
         st2, b2 = arm(tok, jurl.split("?")[0] + "/start?api-version=" + APP_VER,
                       method="POST", body={}, timeout=120)
         jb["exec"] = (b2.get("name") if isinstance(b2, dict) else None)
-        emit("job-start", name=jb["name"], http=st2, execname=jb["exec"],
-             **({} if st2 in (200, 201, 202) else errk(st2, b2)))
+        if st2 in (200, 201, 202):
+            emit("job-start", name=jb["name"], http=st2, execname=jb["exec"])
+        else:
+            ek2 = errk(st2, b2)
+            emit("job-start", name=jb["name"], http=st2, execname=jb["exec"],
+                 code=(ek2.get("code") or ek2.get("raw") or "")[:160],
+                 msg=(ek2.get("message") or "")[:220])
     started = [j for j in jobs if j.get("exec")]
     emit("jobs-started", n=len(started), of=len(jobs),
          names=",".join(j["name"] for j in started))
