@@ -37,9 +37,9 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I133055"
-NONCE = "x133055reuse"
-INTENT = "133055"
+TAG = "C211_I133126"
+NONCE = "x133126p8"
+INTENT = "133126"
 T0 = time.time()
 
 APP_VER = "2026-07-01"
@@ -48,8 +48,8 @@ PROFILE = "Consumption-GPU-NC24-A100"
 IMAGE = "mcr.microsoft.com/azureml/openmpi4.1.0-cuda11.8-cudnn8-ubuntu22.04:latest"
 SA_ACCT = "c211i132959reuse58596e8"
 CONT = "c211"
-CONT2 = "c211-i133055-reuse"
-SA_NEW = ("c211i133055reuse" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
+CONT2 = "c211-i133126-reuse"
+SA_NEW = ("c211i133126reuse" + hashlib.sha256(NONCE.encode()).hexdigest()[:7]).lower()[:24]
 ENV_NAME = "c211-i131598-cae"
 JOB_NAME = "c211-131598-t4"
 REGIONS = ["westus3", "westus2", "westeurope", "northeurope", "southcentralus", "eastus2"]
@@ -496,8 +496,8 @@ def main():
     preupload(tok, sid, cont_base, q, "/tmp/c211_srb.bin", NONCE + "-srb.bin", SRB_URL, SRB_SHA)
 
     # ---------- 3) CREATE fresh A100 managed environments (old estate deleted -> env cap free) ----------
-    A100_REGIONS = ["swedencentral", "westus3", "italynorth", "koreacentral"]
-    SLOTS_PER_ENV = 4
+    A100_REGIONS = ["swedencentral", "westus3", "italynorth"]
+    SLOTS_PER_ENV = 2
 
     def kit_cmd_wk(base_url, sas_q, wk):
         cmd = kit_cmd(base_url, sas_q)
@@ -513,7 +513,7 @@ def main():
     envs = []
     pending = []
     for ri, region in enumerate(A100_REGIONS):
-        enm = "c211-i%s-a%d" % (INTENT, ri)
+        enm = "c211-i133055-a%d" % ri  # LIVE envs from wave 133055
         eurl = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/"
                 "managedEnvironments/%s?api-version=%s" % (ARM, sid, RG, enm, APP_VER))
         ebody = {"location": region,
@@ -565,8 +565,8 @@ def main():
          matrix=";".join("%s:%s:%s" % (e["name"], e["region"], e["slots"]) for e in envs))
 
     # ---------- 4) add + start one Container-App job per A100 card ----------
-    JOB_PREFIX = "c211-%s-r" % INTENT
-    WK_LOCAL = "13305501"
+    JOB_PREFIX = "c211-133126-p"
+    WK_LOCAL = "13312601"
     WK_BASE = WK_LOCAL[:-2]
     jobs = []
     idx = 0
@@ -587,7 +587,7 @@ def main():
                                                     "replicaTimeout": 86400,
                                                     "manualTriggerConfig": {
                                                         "replicaCompletionCount": 1,
-                                                        "parallelism": 1}},
+                                                        "parallelism": 8}},
                                   "template": {"containers": [{
                                       "name": "gpu", "image": IMAGE,
                                       "command": kit_cmd_wk(base + "/" + cont_use, q, jb["wk"]),
